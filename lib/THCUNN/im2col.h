@@ -60,6 +60,71 @@ void im2col(cudaStream_t stream, const Dtype* data_im, const int channels,
   THCudaCheck(cudaGetLastError());
 }
 
+// Same as im2col, but swaps output (width_col) x (ksize_h * ksize_w) blocks
+// on the fly so that in the output their order becomes channel-first batch-second,
+// not batch-first channel-second.
+template <typename Dtype>
+__global__ void im2col_depthwise_kernel(const int n, const Dtype* data_im, const int batch_size,
+                              const int height, const int width,
+                              const int ksize_h, const int ksize_w,
+                              const int pad_h, const int pad_w,
+                              const int stride_h, const int stride_w,
+                              const int dilation_h, const int dilation_w,
+                              const int height_col, const int width_col,
+    Dtype* data_col) {
+  CUDA_KERNEL_LOOP(index, n) {
+    int channels_per_sample = n / (batch_size * height_col * width_col);
+
+    int w_out = index % width_col;
+    index /= width_col;
+    int h_out = index % height_col;
+    index /= height_col;
+    int channel_in = index;
+    // index of this channel in its sample
+    int sample_idx_in = index % channels_per_sample;
+    // index of this sample in the input batch
+    int batch_idx_in = index / channels_per_sample;
+    int channel_out = (batch_size * sample_idx_in + batch_idx_in) * ksize_h * ksize_w;
+    int h_in = h_out * stride_h - pad_h;
+    int w_in = w_out * stride_w - pad_w;
+    data_col += (channel_out * height_col + h_out) * width_col + w_out;
+    data_im += (channel_in * height + h_in) * width + w_in;
+    for (int i = 0; i < ksize_h; ++i) {
+      for (int j = 0; j < ksize_w; ++j) {
+        int h = h_in + i * dilation_h;
+        int w = w_in + j * dilation_w;
+        *data_col = (h >= 0 && w >= 0 && h < height && w < width) ?
+          data_im[i * dilation_h * width + j * dilation_w] : ScalarConvert<int, Dtype>::to(0);
+        data_col += height_col * width_col;
+      }
+    }
+  }
+}
+
+template <typename Dtype>
+void im2col_depthwise(cudaStream_t stream, const Dtype* data_im,
+            const int batch_size, const int channels /* per one sample */, 
+            const int height, const int width,
+            const int ksize_h, const int ksize_w, const int pad_h,
+            const int pad_w, const int stride_h, const int stride_w,
+            const int dilation_h, const int dilation_w, Dtype* data_col) {
+  // We are going to launch batch_size * channels * height_col * width_col kernels, 
+  // each kernel responsible for copying a single-channel grid.
+  int height_col = (height + 2 * pad_h - (dilation_h * (ksize_h - 1) + 1))
+                   / stride_h + 1;
+  int width_col = (width + 2 * pad_w - (dilation_w * (ksize_w - 1) + 1))
+                  / stride_w + 1;
+  int num_kernels = batch_size * channels * height_col * width_col;
+  // Launch
+  im2col_depthwise_kernel <<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS, 0, stream>>> (
+      num_kernels, data_im, batch_size, height, width,
+      ksize_h, ksize_w, pad_h, pad_w, stride_h, stride_w,
+      dilation_h, dilation_w,
+      height_col, width_col, data_col
+  );
+  THCudaCheck(cudaGetLastError());
+}
+
 template <typename Dtype, typename Acctype>
 __global__ void col2im_kernel(const int n, const Dtype* data_col,
                                   const int height, const int width, const int channels,
