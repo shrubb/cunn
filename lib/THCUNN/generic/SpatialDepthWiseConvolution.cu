@@ -3,6 +3,7 @@
 #else
 
 #include "common.h"
+#include <vector>
 
 // for updateOutput
 __global__ void fillOutputWithBiasKernel(
@@ -162,10 +163,24 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   THCTensor *input_n = THCTensor_(new)(state);
   THCTensor *output_n = THCTensor_(new)(state);
 
-  // Helpers for DepthWiseConvolution
-  THCTensor *input_i = THCTensor_(new)(state);
-  THCTensor *output_i = THCTensor_(new)(state);
-  THCTensor *weight_i = THCTensor_(new)(state);
+  // For cublas<t>gemmBatched
+  const real **columns_batches  = NULL; // I'd use nullptr but someone may be using a medieval compiler
+  const real **weightT_batches  = NULL;
+  real **output_n_batches = NULL;
+  THCudaCheck(cudaMalloc(&columns_batches,  sizeof(real*) * nInputPlane));
+  THCudaCheck(cudaMalloc(&weightT_batches,  sizeof(real*) * nInputPlane));
+  THCudaCheck(cudaMalloc(&output_n_batches, sizeof(real*) * nInputPlane));
+  std::vector<real*> columns_batches_host (nInputPlane);
+  std::vector<real*> weightT_batches_host (nInputPlane);
+  std::vector<real*> output_n_batches_host(nInputPlane);
+  for (int k = 0; k < nInputPlane; ++k) {
+    columns_batches_host[k] = THCTensor_(data)(state, columns) + k * columns->stride[0]*kW*kH;
+    weightT_batches_host[k] = THCTensor_(data)(state, weightT) + k * weightT->stride[0];
+  }
+  THCudaCheck(cudaMemcpy(columns_batches, columns_batches_host.data(), 
+    sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice));
+  THCudaCheck(cudaMemcpy(weightT_batches, weightT_batches_host.data(), 
+    sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice));
 
   // Do bias first (fill the output)
   if (bias) {
@@ -174,6 +189,7 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
       CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>> (
         THCTensor_(data)(state, output), batchSize, outputHeight*outputWidth,
         THCTensor_(data)(state, bias), nInputPlane, nOutputPlane);
+    THCudaCheck(cudaGetLastError());
   } else {
     THCTensor_(zero)(state, output);
   }
@@ -184,7 +200,6 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
     THCTensor_(select)(state, input_n, input, 0, elt);
     THCTensor_(select)(state, output_n, output, 0, elt);
 
-/* NEW
     // Extract columns:
     im2col(
       THCState_getCurrentStream(state),
@@ -193,32 +208,38 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
       1, 1, THCTensor_(data)(state, columns)
     );
 
-    // M,N,K are dims of matrix A and B
-    // (see http://docs.nvidia.com/cuda/cublas/#cublas-lt-t-gt-gemm)
-    long m = nOutputPlane;
-    long n = columns->size[1];
-    long k = nInputPlane*kH*kW;
+    for (int k = 0; k < nInputPlane; ++k) {
+      output_n_batches_host[k] = THCTensor_(data)(state, output_n) + k * output_n->stride[0];
+    }
+    cudaMemcpy(output_n_batches, output_n_batches_host.data(), 
+      sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice);
 
-    // Do GEMM (note: this is a bit confusing because gemm assumes column-major matrices)
-    #ifdef THC_REAL_IS_FLOAT
-    THCudaBlas_Sgemm(
-    #elif defined(THC_REAL_IS_HALF)
-    THCudaBlas_Hgemm(
-    #elif defined(THC_REAL_IS_DOUBLE)
-    THCudaBlas_Dgemm(
-    #endif
+    #ifndef THC_REAL_IS_HALF
+      // M,N,K are dims of matrix A and B
+      // (see http://docs.nvidia.com/cuda/cublas/#cublas-lt-t-gt-gemm)
+      long m = nOutputPlane;
+      long n = outputHeight*outputWidth;
+      long k = kH*kW;
+
+      // Do GEMM (note: this is a bit confusing because gemm assumes column-major matrices)
+      #ifdef THC_REAL_IS_FLOAT
+      THCudaBlas_SgemmBatched(
+      #elif defined(THC_REAL_IS_DOUBLE)
+      THCudaBlas_DgemmBatched(
+      #endif
         state,
         'n', 'n',
         n, m, k,
         ScalarConvert<int, real>::to(1),
-        THCTensor_(data)(state, columns), n,
-        THCTensor_(data)(state, weight), k,
+        columns_batches, n,
+        weightT_batches, k,
         ScalarConvert<int, real>::to(1),
-        THCTensor_(data)(state, output_n), n
-    );
-*/
+        output_n_batches, n,
+        nInputPlane
+      );
+    #endif
 
-/* REMOVE_OLD*/
+/* REMOVE_OLD
 
     for (int ipelt = 0; ipelt < nInputPlane; ipelt++)
     {
@@ -259,7 +280,7 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
           THCTensor_(data)(state, output_i), n
       );
     }
-/**/
+*/
   }
 
   // Transpose weight back using temporary `columns` tensor's space.
@@ -278,17 +299,16 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   THCTensor_(free)(state, input_n);
   THCTensor_(free)(state, output_n);
 
-  THCTensor_(free)(state, input_i);
-  THCTensor_(free)(state, output_i);
-
-  THCTensor_(free)(state, weight_i);
-
   THCTensor_(free)(state, weight);
   THCTensor_(free)(state, weight_viewT);
   THCTensor_(free)(state, weightT);
   THCTensor_(free)(state, weightT_viewT);
   THCTensor_(free)(state, columns_weight);
   THCTensor_(free)(state, columns_weightT);
+
+  cudaFree(columns_batches);
+  cudaFree(weightT_batches);
+  cudaFree(output_n_batches);
 
   // Transpose output
   THCTensor_(resize4d)(state, output, batchSize, nInputPlane * nOutputPlane, outputHeight, outputWidth);
