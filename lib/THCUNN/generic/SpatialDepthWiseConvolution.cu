@@ -434,28 +434,15 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
     }
   }
 
-
   THNN_(SpatialDepthWiseConvolution_shapeCheck)
        (state, input, gradOutput, gradWeight, gradBias, kH, kW, dH, dW, padH, padW);
 
-  // Transpose gradWeight & gradBias
+  // Transpose gradWeight
   THCTensor_(transpose)(state, gradWeight, NULL, 0, 1);
 
-
-  THCTensor *_gradBias = NULL;
-  if(gradBias) {
-    THCTensor_(transpose)(state, gradBias, NULL, 0, 1);
-    _gradBias = gradBias;
-    gradBias = THCTensor_(newContiguous)(state, gradBias);
-
-  }
-
   THCTensor *_gradWeight;
-
   _gradWeight = gradWeight;
-
   gradWeight = THCTensor_(newContiguous)(state, gradWeight);
-
 
   // resize gradWeight
   long s1 = gradWeight->size[0];
@@ -501,25 +488,55 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   THCTensor *input_i = THCTensor_(new)(state);
   THCTensor *gradWeight_i = THCTensor_(new)(state);
 
-  THCTensor *gradBias_i = NULL;
-  if(gradBias) {
-    gradBias_i = THCTensor_(new)(state);
-  }
-
   // For each elt in batch, do:
   for (int elt = 0; elt < batchSize; elt ++) {
     // Matrix mulitply per output:
     THCTensor_(select)(state, input_n, input, 0, elt);
     THCTensor_(select)(state, gradOutput_n, gradOutput, 0, elt);
 
+    // Do Bias:
+    // M,N,K are dims of matrix A and B
+    // (see http://docs.nvidia.com/cuda/cublas/#cublas-lt-t-gt-gemm)
+    long m_ = nInputPlane * nOutputPlane;
+    long k_ = outputHeight * outputWidth;
+
+    // Do GEMV (note: this is a bit confusing because gemv assumes column-major matrices)
+    if (gradBias) {
+      #if defined(THC_REAL_IS_FLOAT) || defined(THC_REAL_IS_DOUBLE)
+      #ifdef THC_REAL_IS_FLOAT
+      THCudaBlas_Sgemv(
+      #elif defined(THC_REAL_IS_DOUBLE)
+      THCudaBlas_Dgemv(
+      #endif
+          state,
+          't',
+          k_, m_,
+          scale,
+          THCTensor_(data)(state, gradOutput_n), k_,
+          THCTensor_(data)(state, ones), 1,
+          ScalarConvert<int, real>::to(1),
+          THCTensor_(data)(state, gradBias), 1
+      );
+      #endif
+      #ifdef THC_REAL_IS_HALF
+      THCudaBlas_Hgemm(
+          state,
+          't', 'n',
+          m_, 1, k_,
+          scale,
+          THCTensor_(data)(state, gradOutput_n), k_,
+          THCTensor_(data)(state, ones), k_,
+          ScalarConvert<int, real>::to(1),
+          THCTensor_(data)(state, gradBias), m_
+      );
+      #endif
+    }
+
     for (int ipelt = 0; ipelt < nInputPlane; ipelt++)
     {
       THCTensor_(narrow)(state, input_i, input_n, 0, ipelt, 1);
       THCTensor_(select)(state, gradOutput_i, gradOutput_n, 0, ipelt);
       THCTensor_(select)(state, gradWeight_i, gradWeight, 0, ipelt);
-      if (gradBias) {
-        THCTensor_(select)(state, gradBias_i, gradBias, 0, ipelt);
-      }
 
       // Extract columns:
       im2col(
@@ -552,61 +569,14 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
           ScalarConvert<int, real>::to(1),
           THCTensor_(data)(state, gradWeight_i), n
       );
-
-      // Do Bias:
-      // M,N,K are dims of matrix A and B
-      // (see http://docs.nvidia.com/cuda/cublas/#cublas-lt-t-gt-gemm)
-      long m_ = nOutputPlane;
-      long k_ = outputHeight * outputWidth;
-
-      // Do GEMV (note: this is a bit confusing because gemv assumes column-major matrices)
-      if (gradBias) {
-        #if defined(THC_REAL_IS_FLOAT) || defined(THC_REAL_IS_DOUBLE)
-        #ifdef THC_REAL_IS_FLOAT
-        THCudaBlas_Sgemv(
-        #elif defined(THC_REAL_IS_DOUBLE)
-        THCudaBlas_Dgemv(
-        #endif
-            state,
-            't',
-            k_, m_,
-            scale,
-            THCTensor_(data)(state, gradOutput_i), k_,
-            THCTensor_(data)(state, ones), 1,
-            ScalarConvert<int, real>::to(1),
-            THCTensor_(data)(state, gradBias_i), 1
-        );
-        #endif
-        #ifdef THC_REAL_IS_HALF
-        THCudaBlas_Hgemm(
-            state,
-            't', 'n',
-            m_, 1, k_,
-            scale,
-            THCTensor_(data)(state, gradOutput_i), k_,
-            THCTensor_(data)(state, ones), k_,
-            ScalarConvert<int, real>::to(1),
-            THCTensor_(data)(state, gradBias_i), m_
-        );
-        #endif
-      }
     }
   }
-
 
   // Copy back and transpose back
   THCTensor_(transpose)(state, _gradWeight, NULL, 0, 1);
   THCTensor_(resize4d)(state, _gradWeight, nInputPlane, nOutputPlane, kH, kW);
   THCTensor_(copy)(state, _gradWeight, gradWeight);
   THCTensor_(transpose)(state, _gradWeight, NULL, 0, 1);
-
-  if(gradBias) {
-    THCTensor_(transpose)(state, _gradBias, NULL, 0, 1);
-    THCTensor_(resize2d)(state, _gradBias, nInputPlane, nOutputPlane);
-    THCTensor_(copy)(state, _gradBias, gradBias);
-    THCTensor_(transpose)(state, _gradBias, NULL, 0, 1);
-  }
-
 
   // Free
   THCTensor_(free)(state, input_n);
@@ -615,8 +585,6 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   THCTensor_(free)(state, gradOutput_i);
   THCTensor_(free)(state, gradWeight_i);
   THCTensor_(free)(state, gradWeight);
-  THCTensor_(free)(state, gradBias_i);
-  THCTensor_(free)(state, gradBias);
 
   // Resize
   if (batch == 0) {
