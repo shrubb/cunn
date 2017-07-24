@@ -2,6 +2,30 @@
 #define THC_GENERIC_FILE "generic/SpatialDepthWiseConvolution.cu"
 #else
 
+#include "common.h"
+
+// for updateOutput
+__global__ void fillOutputWithBiasKernel(
+  real *output, int batchSize, int elementsPerPlane,
+  real *bias, int nInputPlane, int nOutputPlane) {
+
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (index < batchSize * nInputPlane * nOutputPlane * elementsPerPlane) {
+    real *outputPixel = &output[index];
+
+    // index of a pixel in the output sample
+    index %= (elementsPerPlane * nInputPlane * nOutputPlane);
+    int inPlaneIdx = index / (elementsPerPlane * nOutputPlane);
+    // index of a pixel in the output for a single input
+    index %= (elementsPerPlane * nOutputPlane);
+    int outPlaneIdx = index / elementsPerPlane;
+
+    // bias is of size (nOutputPlane) x (nInputPlane)
+    *outputPixel = bias[outPlaneIdx*nInputPlane + inPlaneIdx];
+  }
+}
+
 static inline void THNN_(SpatialDepthWiseConvolution_shapeCheck)(
                          THCState *state,
                          THCTensor *input, THCTensor *gradOutput,
@@ -82,16 +106,9 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   THNN_(SpatialDepthWiseConvolution_shapeCheck)
        (state, input, NULL, weight, bias, kH, kW, dH, dW, padH, padW);
 
-
   // Transpose weight & bias
   THCTensor *_weight = THCTensor_(newTranspose)(state, weight, 0, 1);
   weight = THCTensor_(newContiguous)(state, _weight);
-
-  THCTensor *_bias = NULL;
-  if(bias) {
-    _bias = THCTensor_(newTranspose)(state, bias, 0, 1);
-    bias = THCTensor_(newContiguous)(state, _bias);
-  }
 
   // resize weight
   long s1 = weight->size[0];
@@ -123,15 +140,6 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   // Resize temporary columns
   THCTensor_(resize2d)(state, columns, kW*kH, outputHeight*outputWidth);
 
-  // Define a buffer of ones, for bias accumulation
-  // Note: this buffer can be shared with other modules, it only ever gets increased,
-  // and always contains ones.
-  if (ones->nDimension != 2 || ones->size[0]*ones->size[1] < outputHeight*outputWidth) {
-    // Resize plane and fill with ones...
-    THCTensor_(resize2d)(state, ones, outputHeight, outputWidth);
-    THCTensor_(fill)(state, ones, ScalarConvert<int, real>::to(1));
-  }
-
   // Helpers
   THCTensor *input_n = THCTensor_(new)(state);
   THCTensor *output_n = THCTensor_(new)(state);
@@ -140,75 +148,23 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   THCTensor *input_i = THCTensor_(new)(state);
   THCTensor *output_i = THCTensor_(new)(state);
   THCTensor *weight_i = THCTensor_(new)(state);
-  
-  // Device data pointers for cublas<t>gemmBatched
-  real *onesPointers[nInputPlane];
-  real *biasPointers[nInputPlane];
-  real *outputPointers[nInputPlane];
-  const real **onesPointers_d, **biasPointers_d;
-  real **outputPointers_d;
 
-  for (int k = 0; k < nInputPlane; ++k) {
-    onesPointers[k] = THCTensor_(data)(state, ones);
-    biasPointers[k] = THCTensor_(data)(state, bias) + k * bias->stride[0];
+  // Do bias first (fill the output)
+  if (bias) {
+    fillOutputWithBiasKernel 
+      <<<GET_BLOCKS(batchSize*outputHeight*outputWidth*nInputPlane*nOutputPlane), 
+      CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>> (
+        THCTensor_(data)(state, output), batchSize, outputHeight*outputWidth,
+        THCTensor_(data)(state, bias), nInputPlane, nOutputPlane);
+  } else {
+    THCTensor_(zero)(state, output);
   }
-  cudaMalloc(&onesPointers_d, sizeof(real*)*nInputPlane);
-  cudaMemcpy(onesPointers_d, onesPointers, sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice);
-  cudaMalloc(&biasPointers_d, sizeof(real*)*nInputPlane);
-  cudaMemcpy(biasPointers_d, biasPointers, sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice);
-  cudaMalloc(&outputPointers_d, sizeof(real*)*nInputPlane);
 
-  // THCTensor *bias_i = NULL;
-  // if(bias) {
-  //   bias_i = THCTensor_(new)(state);
-  // }
   // For each elt in batch, do:
   for (int elt = 0; elt < batchSize; elt++) {
     // Matrix mulitply per output:
     THCTensor_(select)(state, input_n, input, 0, elt);
     THCTensor_(select)(state, output_n, output, 0, elt);
-
-    for (int k = 0; k < nInputPlane; ++k) {
-      outputPointers[k] = THCTensor_(data)(state, output_n) + k * output_n->stride[0];
-    }
-    cudaMemcpy(outputPointers_d, outputPointers, 
-      sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice);
-
-    // if (bias) {
-    //   THCTensor_(select)(state, bias_i, bias, 0, ipelt);
-    // }
-    // Do Bias first:
-    // M,N,K are dims of matrix A and B
-    // (see http://docs.nvidia.com/cuda/cublas/#cublas-lt-t-gt-gemm)
-    long m_ = nOutputPlane;
-    long n_ = outputHeight * outputWidth;
-    long k_ = 1;
-
-    // Do GEMM (note: this is a bit confusing because gemm assumes column-major matrices)
-    // A^T is NxK, B is KxM
-    if (bias) {
-      #ifndef THC_REAL_IS_HALF
-        #ifdef THC_REAL_IS_FLOAT
-        THCudaBlas_SgemmBatched(
-        // #elif defined(THC_REAL_IS_HALF)
-        // THCudaBlas_HgemmBatched(
-        #elif defined(THC_REAL_IS_DOUBLE)
-        THCudaBlas_DgemmBatched(
-        #endif
-            state,
-            't', 'n',
-            n_, m_, k_,
-            ScalarConvert<int, real>::to(1),
-            onesPointers_d, k_,
-            biasPointers_d, k_,
-            ScalarConvert<int, real>::to(0),
-            outputPointers_d, n_,
-            nInputPlane
-      );
-      #endif
-    } else {
-      THCTensor_(zero)(state, output_n);
-    }
 
     for (int ipelt = 0; ipelt < nInputPlane; ipelt++)
     {
@@ -252,10 +208,6 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   }
 
   // Free
-  cudaFree(onesPointers_d);
-  cudaFree(biasPointers_d);
-  cudaFree(outputPointers_d);
-
   THCTensor_(free)(state, input_n);
   THCTensor_(free)(state, output_n);
 
@@ -267,9 +219,6 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   THCTensor_(free)(state, weight);
   THCTensor_(free)(state, _weight);
 
-  // THCTensor_(free)(state, bias_i);
-  THCTensor_(free)(state, bias);
-  THCTensor_(free)(state, _bias);
   // Transpose output
   THCTensor_(resize4d)(state, output, batchSize, nInputPlane * nOutputPlane, outputHeight, outputWidth);
 
