@@ -164,24 +164,14 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   THCTensor *output_n = THCTensor_(new)(state);
 
   // For cublas<t>gemmBatched
-  
-  // Using `ones` buffer for these pointers!
-  if (not ones->storage) {
-    THCTensor_(resize1d)(state, ones, (nInputPlane*(2 + batchSize)) * sizeof(real*) / sizeof(real));
-  } else if (ones->storage->size * sizeof(real) < 
-    (nInputPlane*(2 + batchSize)) * sizeof(real*) / sizeof(real)) {
-
-    THCStorage_(resize)(state, ones->storage, 
-      (nInputPlane*(2 + batchSize)) * sizeof(real*)); // / sizeof(real)
-  }
 
   // I'd love to use nullptr but someone might be using a medieval compiler
-  const real **columns_batches = reinterpret_cast<const real **>(THCStorage_(data)(state, ones->storage));//NULL;
-  const real **weightT_batches = columns_batches + nInputPlane;//NULL;
-  real **output_n_batches = const_cast<real**>(weightT_batches) + nInputPlane;//NULL;
-  // THCudaCheck(cudaMalloc(&columns_batches,  sizeof(real*) * nInputPlane));
-  // THCudaCheck(cudaMalloc(&weightT_batches,  sizeof(real*) * nInputPlane));
-  // THCudaCheck(cudaMalloc(&output_n_batches, sizeof(real*) * batchSize*nInputPlane));
+  const real **columns_batches = NULL;
+  const real **weightT_batches = NULL;
+  real **output_n_batches      = NULL;
+  THCudaCheck(cudaMalloc(&columns_batches,  sizeof(real*) * nInputPlane));
+  THCudaCheck(cudaMalloc(&weightT_batches,  sizeof(real*) * nInputPlane));
+  THCudaCheck(cudaMalloc(&output_n_batches, sizeof(real*) * batchSize*nInputPlane));
   std::vector<real*> columns_batches_host (nInputPlane);
   std::vector<real*> weightT_batches_host (nInputPlane);
   std::vector<real*> output_n_batches_host(batchSize*nInputPlane);
@@ -274,9 +264,9 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   THCTensor_(free)(state, columns_weight);
   THCTensor_(free)(state, columns_weightT);
 
-  // THCudaCheck(cudaFree(columns_batches));
-  // THCudaCheck(cudaFree(weightT_batches));
-  // THCudaCheck(cudaFree(output_n_batches));
+  THCudaCheck(cudaFree(columns_batches));
+  THCudaCheck(cudaFree(weightT_batches));
+  THCudaCheck(cudaFree(output_n_batches));
 
   // Transpose output
   THCTensor_(resize4d)(state, output, batchSize, nInputPlane * nOutputPlane, outputHeight, outputWidth);
