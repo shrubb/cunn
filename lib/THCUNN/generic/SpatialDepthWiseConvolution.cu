@@ -106,16 +106,10 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   THNN_(SpatialDepthWiseConvolution_shapeCheck)
        (state, input, NULL, weight, bias, kH, kW, dH, dW, padH, padW);
 
-  // Transpose weight & bias
-  THCTensor *_weight = THCTensor_(newTranspose)(state, weight, 0, 1);
-  weight = THCTensor_(newContiguous)(state, _weight);
-
-  // resize weight
-  long s1 = weight->size[0];
-  long s2 = weight->size[1];
-  long s3 = weight->size[2] * weight->size[3];
-  weight = THCTensor_(newWithStorage3d)(state, weight->storage, weight->storageOffset,
-          s1, -1, s2, -1, s3, -1);
+  long inputWidth   = input->size[3];
+  long inputHeight  = input->size[2];
+  long outputWidth  = (inputWidth + 2*padW - kW) / dW + 1;
+  long outputHeight = (inputHeight + 2*padH - kH) / dH + 1;
 
   input = THCTensor_(newContiguous)(state, input);
 
@@ -126,19 +120,43 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
     THCTensor_(resize4d)(state, input, 1, input->size[0], input->size[1], input->size[2]);
   }
 
-  long inputWidth   = input->size[3];
-  long inputHeight  = input->size[2];
-  long outputWidth  = (inputWidth + 2*padW - kW) / dW + 1;
-  long outputHeight = (inputHeight + 2*padH - kH) / dH + 1;
-
   // Batch size + input planes
   long batchSize = input->size[0];
 
   // Resize output
   THCTensor_(resize5d)(state, output, batchSize, nInputPlane, nOutputPlane, outputHeight, outputWidth);
-
   // Resize temporary columns
-  THCTensor_(resize2d)(state, columns, kW*kH, outputHeight*outputWidth);
+  THCTensor_(resize2d)(state, columns, nInputPlane*kW*kH, outputHeight*outputWidth);
+
+  // Reshape weight to be (nOutputPlane) x (nInputPlane) x (outputWidth * outputHeight)
+  weight = THCTensor_(newWithStorage3d)(
+    state, weight->storage, weight->storageOffset,
+    weight->size[0], -1,
+    weight->size[1], -1,
+    weight->size[2] * weight->size[3], -1);
+
+  // Transpose weight using temporary `columns` tensor's space
+  THCTensor *weight_viewT = THCTensor_(newTranspose)(state, weight, 0, 1);
+  // Size of `columns` should be enough in general, but who knows, so make sure
+  if (columns->storage->size < nInputPlane*nOutputPlane*kW*kH) {
+    THCStorage_(resize)(state, columns->storage, nInputPlane*nOutputPlane*kW*kH);
+  }
+  THCTensor *columns_weightT = THCTensor_(newWithStorage3d)(
+    state, columns->storage, 0,
+    weight->size[1], -1,
+    weight->size[0], -1,
+    weight->size[2], -1);
+  // This makes a contiguous tensor from weight_viewT, i.e. does the actual transpose
+  THCTensor_(copy)(state, columns_weightT, weight_viewT);
+  // Copy the transposed data back
+  THCTensor_(copy)(state, weight, columns_weightT);
+
+  // Now reshape weight to be (nInputPlane) x (nOutputPlane) x (outputWidth * outputHeight)
+  THCTensor *weightT = THCTensor_(newWithStorage3d)(
+    state, weight->storage, weight->storageOffset,
+    weight->size[1], -1,
+    weight->size[0], -1,
+    weight->size[2], -1);
 
   // Helpers
   THCTensor *input_n = THCTensor_(new)(state);
@@ -166,12 +184,48 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
     THCTensor_(select)(state, input_n, input, 0, elt);
     THCTensor_(select)(state, output_n, output, 0, elt);
 
+/* NEW
+    // Extract columns:
+    im2col(
+      THCState_getCurrentStream(state),
+      THCTensor_(data)(state, input_n),
+      nInputPlane, inputHeight, inputWidth, kH, kW, padH, padW, dH, dW,
+      1, 1, THCTensor_(data)(state, columns)
+    );
+
+    // M,N,K are dims of matrix A and B
+    // (see http://docs.nvidia.com/cuda/cublas/#cublas-lt-t-gt-gemm)
+    long m = nOutputPlane;
+    long n = columns->size[1];
+    long k = nInputPlane*kH*kW;
+
+    // Do GEMM (note: this is a bit confusing because gemm assumes column-major matrices)
+    #ifdef THC_REAL_IS_FLOAT
+    THCudaBlas_Sgemm(
+    #elif defined(THC_REAL_IS_HALF)
+    THCudaBlas_Hgemm(
+    #elif defined(THC_REAL_IS_DOUBLE)
+    THCudaBlas_Dgemm(
+    #endif
+        state,
+        'n', 'n',
+        n, m, k,
+        ScalarConvert<int, real>::to(1),
+        THCTensor_(data)(state, columns), n,
+        THCTensor_(data)(state, weight), k,
+        ScalarConvert<int, real>::to(1),
+        THCTensor_(data)(state, output_n), n
+    );
+*/
+
+/* REMOVE_OLD*/
+
     for (int ipelt = 0; ipelt < nInputPlane; ipelt++)
     {
       // Fetch ipelt-th input plane
       THCTensor_(narrow)(state, input_i, input_n, 0, ipelt, 1);
       THCTensor_(select)(state, output_i, output_n, 0, ipelt);
-      THCTensor_(select)(state, weight_i, weight, 0, ipelt);
+      THCTensor_(select)(state, weight_i, weightT, 0, ipelt);
 
       // Extract columns:
       im2col(
@@ -205,7 +259,20 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
           THCTensor_(data)(state, output_i), n
       );
     }
+/**/
   }
+
+  // Transpose weight back using temporary `columns` tensor's space.
+  THCTensor *columns_weight = THCTensor_(newWithStorage3d)(
+    state, columns->storage, 0,
+    weight->size[0], -1,
+    weight->size[1], -1,
+    weight->size[2], -1);
+  THCTensor *weightT_viewT = THCTensor_(newTranspose)(state, weightT, 0, 1);
+  // This makes a contiguous tensor from weight_viewT, i.e. does the actual transpose
+  THCTensor_(copy)(state, columns_weight, weightT_viewT);
+  // Copy the transposed data back
+  THCTensor_(copy)(state, weight, columns_weight);
 
   // Free
   THCTensor_(free)(state, input_n);
@@ -217,7 +284,11 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   THCTensor_(free)(state, weight_i);
 
   THCTensor_(free)(state, weight);
-  THCTensor_(free)(state, _weight);
+  THCTensor_(free)(state, weight_viewT);
+  THCTensor_(free)(state, weightT);
+  THCTensor_(free)(state, weightT_viewT);
+  THCTensor_(free)(state, columns_weight);
+  THCTensor_(free)(state, columns_weightT);
 
   // Transpose output
   THCTensor_(resize4d)(state, output, batchSize, nInputPlane * nOutputPlane, outputHeight, outputWidth);
