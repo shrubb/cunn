@@ -338,10 +338,7 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
   weight = THCTensor_(newWithStorage3d)(state, weight->storage, weight->storageOffset,
           s1, -1, s2, -1, s3, -1);
 
-
-
   input = THCTensor_(newContiguous)(state, input);
-
 
   int batch = 1;
   if (input->nDimension == 3) {
@@ -363,7 +360,7 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
   THCTensor_(resize4d)(state, gradInput, batchSize, nInputPlane, inputHeight, inputWidth);
 
   // Resize temporary columns
-  THCTensor_(resize2d)(state, gradColumns, 1*kW*kH, outputHeight*outputWidth);
+  THCTensor_(resize3d)(state, gradColumns, nInputPlane, kW*kH, outputHeight*outputWidth);
 
   // Helpers
   THCTensor *gradInput_n = THCTensor_(new)(state);
@@ -373,6 +370,7 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
   THCTensor *gradOutput_i = THCTensor_(new)(state);
   THCTensor *gradInput_i = THCTensor_(new)(state);
   THCTensor *weight_i = THCTensor_(new)(state);
+  THCTensor *gradColumns_i = THCTensor_(new)(state);
 
   // For each elt in batch, do:
   for (int elt = 0; elt < batchSize; elt ++) {
@@ -387,11 +385,13 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
 
       // Fetch ipelt-th input plane
       THCTensor_(narrow)(state, gradInput_i, gradInput_n, 0, ipelt, 1);
+      // gradOutput_i is of size (nOutputPlane) x (outputHeight) x (outputWidth)
       THCTensor_(select)(state, gradOutput_i, gradOutput_n, 0, ipelt);
       THCTensor_(select)(state, weight_i, weight, 0, ipelt);
+      THCTensor_(select)(state, gradColumns_i, gradColumns, 0, ipelt);
 
       long m = 1*kW*kH;
-      long n = gradColumns->size[1];
+      long n = outputHeight*outputWidth; // this is gradColumns's last dimension
       long k = nOutputPlane;
 
       // Do GEMM (note: this is a bit confusing because gemm assumes column-major matrices)
@@ -409,17 +409,17 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
           THCTensor_(data)(state, gradOutput_i), n,
           THCTensor_(data)(state, weight_i), m,
           ScalarConvert<int, real>::to(0),
-          THCTensor_(data)(state, gradColumns), n
+          THCTensor_(data)(state, gradColumns_i), n
       );
-
-      // Unpack columns back into input:
-      col2im<real, accreal>(
-        THCState_getCurrentStream(state),
-        THCTensor_(data)(state, gradColumns),
-        1, inputHeight, inputWidth, kH, kW, padH, padW, dH, dW,
-        1, 1, THCTensor_(data)(state, gradInput_i)
-      );
-      }
+    }
+    
+    // Unpack columns back into input:
+    col2im<real, accreal>(
+      THCState_getCurrentStream(state),
+      THCTensor_(data)(state, gradColumns),
+      nInputPlane, inputHeight, inputWidth, kH, kW, padH, padW, dH, dW,
+      1, 1, THCTensor_(data)(state, gradInput_n)
+    );
   }
 
   // Free
