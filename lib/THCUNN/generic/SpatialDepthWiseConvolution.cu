@@ -522,7 +522,7 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
     THCTensor_(resize4d)(state, gradWeight, nOutputPlane, nInputPlane, kH, kW);
   }
 
- gradOutput = THCTensor_(newWithTensor)(state, gradOutput);
+  gradOutput = THCTensor_(newWithTensor)(state, gradOutput);
   if (input->nDimension == 3) {
     if (gradOutput->nDimension == 3) {
       THCTensor_(resize4d)(state, gradOutput, nInputPlane, nOutputPlane, gradOutput->size[1], gradOutput->size[2]);
@@ -538,19 +538,35 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   THNN_(SpatialDepthWiseConvolution_shapeCheck)
        (state, input, gradOutput, gradWeight, gradBias, kH, kW, dH, dW, padH, padW);
 
-  // Transpose gradWeight
-  THCTensor_(transpose)(state, gradWeight, NULL, 0, 1);
+  // Reshape gradWeight to be (nOutputPlane) x (nInputPlane) x (outputWidth * outputHeight)
+  gradWeight = THCTensor_(newWithStorage3d)(
+    state, gradWeight->storage, gradWeight->storageOffset,
+    gradWeight->size[0], -1,
+    gradWeight->size[1], -1,
+    gradWeight->size[2] * gradWeight->size[3], -1);
 
-  THCTensor *_gradWeight;
-  _gradWeight = gradWeight;
-  gradWeight = THCTensor_(newContiguous)(state, gradWeight);
+  // Transpose gradWeight using temporary `columns` tensor's space
+  THCTensor *gradWeight_viewT = THCTensor_(newTranspose)(state, gradWeight, 0, 1);
+  // Size of `columns` should be enough in general, but who knows, so make sure
+  if (columns->storage->size < nInputPlane*nOutputPlane*kW*kH) {
+    THCStorage_(resize)(state, columns->storage, nInputPlane*nOutputPlane*kW*kH);
+  }
+  THCTensor *columns_gradWeightT = THCTensor_(newWithStorage3d)(
+    state, columns->storage, 0,
+    gradWeight->size[1], -1,
+    gradWeight->size[0], -1,
+    gradWeight->size[2], -1);
+  // This makes a contiguous tensor from gradWeight_viewT, i.e. does the actual transpose
+  THCTensor_(copy)(state, columns_gradWeightT, gradWeight_viewT);
+  // Copy the transposed data back
+  THCTensor_(copy)(state, gradWeight, columns_gradWeightT);
 
-  // resize gradWeight
-  long s1 = gradWeight->size[0];
-  long s2 = gradWeight->size[1];
-  long s3 = gradWeight->size[2] * gradWeight->size[3];
-  gradWeight = THCTensor_(newWithStorage3d)(state, gradWeight->storage, gradWeight->storageOffset,
-          s1, -1, s2, -1, s3, -1);
+  // Now reshape gradWeightT to be (nInputPlane) x (nOutputPlane) x (outputWidth * outputHeight)
+  THCTensor *gradWeightT = THCTensor_(newWithStorage3d)(
+    state, gradWeight->storage, gradWeight->storageOffset,
+    gradWeight->size[1], -1,
+    gradWeight->size[0], -1,
+    gradWeight->size[2], -1);
 
   input = THCTensor_(newContiguous)(state, input);
 
@@ -578,7 +594,7 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   }
 
   // Resize temporary columns
-  THCTensor_(resize2d)(state, columns, 1*kW*kH, outputHeight*outputWidth);
+  THCTensor_(resize3d)(state, columns, nInputPlane, kW*kH, outputHeight*outputWidth);
 
   // Helpers
   THCTensor *input_n = THCTensor_(new)(state);
@@ -587,7 +603,34 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   // Helpers for DepthWiseConvolution
   THCTensor *gradOutput_i = THCTensor_(new)(state);
   THCTensor *input_i = THCTensor_(new)(state);
-  THCTensor *gradWeight_i = THCTensor_(new)(state);
+  THCTensor *gradWeightT_i = THCTensor_(new)(state);
+  THCTensor *columns_i = THCTensor_(new)(state);
+
+  // For cublas<t>gemmBatched
+
+  // I'd love to use nullptr but someone might be using a medieval compiler
+  const real **columns_batches     = NULL;
+  const real **gradOutput_batches  = NULL;
+  real **gradWeightT_batches       = NULL;
+  THCudaCheck(cudaMalloc(&columns_batches,     sizeof(real*) * nInputPlane));
+  THCudaCheck(cudaMalloc(&gradWeightT_batches, sizeof(real*) * nInputPlane));
+  THCudaCheck(cudaMalloc(&gradOutput_batches,  sizeof(real*) * batchSize*nInputPlane));
+  std::vector<real*> columns_batches_host     (nInputPlane);
+  std::vector<real*> gradWeightT_batches_host (nInputPlane);
+  std::vector<real*> gradOutput_n_batches_host(batchSize*nInputPlane);
+  for (int k = 0; k < nInputPlane; ++k) {
+    columns_batches_host[k] = THCTensor_(data)(state, columns) + k * columns->stride[0];
+    gradWeightT_batches_host[k] = THCTensor_(data)(state, gradWeightT) + k * gradWeightT->stride[0];
+  }
+  for (int k = 0; k < gradOutput_n_batches_host.size(); ++k) {
+    gradOutput_n_batches_host[k] = THCTensor_(data)(state, gradOutput) + k * gradOutput->stride[1];
+  }
+  THCudaCheck(cudaMemcpy(columns_batches, columns_batches_host.data(),
+    sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice));
+  THCudaCheck(cudaMemcpy(gradWeightT_batches, gradWeightT_batches_host.data(),
+    sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice));
+  THCudaCheck(cudaMemcpy(gradOutput_batches, gradOutput_n_batches_host.data(),
+      sizeof(real*)*batchSize*nInputPlane, cudaMemcpyHostToDevice));
 
   // For each elt in batch, do:
   for (int elt = 0; elt < batchSize; elt ++) {
@@ -633,59 +676,71 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
       #endif
     }
 
-    for (int ipelt = 0; ipelt < nInputPlane; ipelt++)
-    {
-      THCTensor_(narrow)(state, input_i, input_n, 0, ipelt, 1);
-      THCTensor_(select)(state, gradOutput_i, gradOutput_n, 0, ipelt);
-      THCTensor_(select)(state, gradWeight_i, gradWeight, 0, ipelt);
+    // Extract columns:
+    im2col(
+      THCState_getCurrentStream(state),
+      THCTensor_(data)(state, input_n),
+      nInputPlane, inputHeight, inputWidth, kH, kW, padH, padW, dH, dW,
+      1, 1, THCTensor_(data)(state, columns)
+    );
 
-      // Extract columns:
-      im2col(
-        THCState_getCurrentStream(state),
-        THCTensor_(data)(state, input_i),
-        1, inputHeight, inputWidth, kH, kW, padH, padW, dH, dW,
-        1, 1, THCTensor_(data)(state, columns)
-      );
-
+    #ifndef THC_REAL_IS_HALF
       // M,N,K are dims of matrix A and B
       // (see http://docs.nvidia.com/cuda/cublas/#cublas-lt-t-gt-gemm)
       long m = nOutputPlane;
       long n = 1*kW*kH;
-      long k = columns->size[1];
+      long k = outputHeight*outputWidth; // this is gradColumns's last dimension
+      const real **gradOutput_n_batches = gradOutput_batches + elt*nInputPlane;
 
       // Do GEMM (note: this is a bit confusing because gemm assumes column-major matrices)
       #ifdef THC_REAL_IS_FLOAT
-      THCudaBlas_Sgemm(
-      #elif defined(THC_REAL_IS_HALF)
-      THCudaBlas_Hgemm(
+      THCudaBlas_SgemmBatched(
       #elif defined(THC_REAL_IS_DOUBLE)
-      THCudaBlas_Dgemm(
+      THCudaBlas_DgemmBatched(
       #endif
           state,
           't', 'n',
           n, m, k,
           scale,
-          THCTensor_(data)(state, columns), k,
-          THCTensor_(data)(state, gradOutput_i), k,
+          columns_batches, k,
+          gradOutput_n_batches, k,
           ScalarConvert<int, real>::to(1),
-          THCTensor_(data)(state, gradWeight_i), n
+          gradWeightT_batches, n,
+          nInputPlane
       );
-    }
+    #endif
   }
 
-  // Copy back and transpose back
-  THCTensor_(transpose)(state, _gradWeight, NULL, 0, 1);
-  THCTensor_(resize4d)(state, _gradWeight, nInputPlane, nOutputPlane, kH, kW);
-  THCTensor_(copy)(state, _gradWeight, gradWeight);
-  THCTensor_(transpose)(state, _gradWeight, NULL, 0, 1);
+  // Transpose gradWeight back using temporary `columns` tensor's space.
+  THCTensor *columns_gradWeight = THCTensor_(newWithStorage3d)(
+    state, columns->storage, 0,
+    gradWeight->size[0], -1,
+    gradWeight->size[1], -1,
+    gradWeight->size[2], -1);
+  THCTensor *gradWeightT_viewT = THCTensor_(newTranspose)(state, gradWeightT, 0, 1);
+  // This makes a contiguous tensor from weight_viewT, i.e. does the actual transpose
+  THCTensor_(copy)(state, columns_gradWeight, gradWeightT_viewT);
+  // Copy the transposed data back
+  THCTensor_(copy)(state, gradWeight, columns_gradWeight);
 
   // Free
   THCTensor_(free)(state, input_n);
   THCTensor_(free)(state, gradOutput_n);
   THCTensor_(free)(state, input_i);
   THCTensor_(free)(state, gradOutput_i);
-  THCTensor_(free)(state, gradWeight_i);
+  THCTensor_(free)(state, columns_i);
+  
   THCTensor_(free)(state, gradWeight);
+  THCTensor_(free)(state, gradWeight_viewT);
+  THCTensor_(free)(state, gradWeightT);
+  THCTensor_(free)(state, gradWeightT_viewT);
+  THCTensor_(free)(state, columns_gradWeight);
+  THCTensor_(free)(state, columns_gradWeightT);
+  THCTensor_(free)(state, gradWeightT_i);
+
+  THCudaCheck(cudaFree(columns_batches));
+  THCudaCheck(cudaFree(gradWeightT_batches));
+  THCudaCheck(cudaFree(gradOutput_batches));
 
   // Resize
   if (batch == 0) {
