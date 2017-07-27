@@ -27,6 +27,37 @@ __global__ void fillOutputWithBiasKernel(
   }
 }
 
+// Helper function. Transposes `tensor` pseudo-in-place using `buffer`.
+// `buffer` is enlarged if needed.
+// This function REQUIRES `buffer` to be non-NULL.
+void transposeWithBuffer(
+  THCState *state, THCTensor *tensor, THCStorage *buffer, int dim1, int dim2) {
+
+  THAssert(buffer != NULL);
+
+  THCTensor *tensor_viewT = THCTensor_(newTranspose)(state, tensor, dim1, dim2);
+  
+  // Size of `buffer` (== `columns`, for example) should be
+  // enough in general, but who knows, so let `setStorageNd` ensure
+  THCTensor *bufferTensorT = THCTensor_(new)(state);
+  THCTensor_(setStorageNd)(state, bufferTensorT, buffer, 0, 
+    tensor_viewT->nDimension, tensor_viewT->size, NULL);
+
+  // This makes a contiguous tensor from `tensor_viewT`, i.e. does the actual transpose
+  THCTensor_(copy)(state, bufferTensorT, tensor_viewT);
+  // Copy the transposed data back
+  THCTensor_(copy)(state, tensor, bufferTensorT);
+
+  // Now reshape `tensor` to match the transposed size
+  std::vector<long> newSize(tensor->size, tensor->size + tensor->nDimension);
+  std::swap(newSize[dim1], newSize[dim2]);
+  THCTensor_(setStorageNd)(state, tensor, tensor->storage,
+    tensor->storageOffset, tensor->nDimension, newSize.data(), NULL);
+
+  THCTensor_(free)(state, tensor_viewT);
+  THCTensor_(free)(state, bufferTensorT);
+}
+
 static inline void THNN_(SpatialDepthWiseConvolution_shapeCheck)(
                          THCState *state,
                          THCTensor *input, THCTensor *gradOutput,
@@ -129,35 +160,7 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   // Resize temporary columns
   THCTensor_(resize3d)(state, columns, nInputPlane, kW*kH, outputHeight*outputWidth);
 
-  // Reshape weight to be (nOutputPlane) x (nInputPlane) x (outputWidth * outputHeight)
-  weight = THCTensor_(newWithStorage3d)(
-    state, weight->storage, weight->storageOffset,
-    weight->size[0], -1,
-    weight->size[1], -1,
-    weight->size[2] * weight->size[3], -1);
-
-  // Transpose weight using temporary `columns` tensor's space
-  THCTensor *weight_viewT = THCTensor_(newTranspose)(state, weight, 0, 1);
-  // Size of `columns` should be enough in general, but who knows, so make sure
-  if (columns->storage->size < nInputPlane*nOutputPlane*kW*kH) {
-    THCStorage_(resize)(state, columns->storage, nInputPlane*nOutputPlane*kW*kH);
-  }
-  THCTensor *columns_weightT = THCTensor_(newWithStorage3d)(
-    state, columns->storage, 0,
-    weight->size[1], -1,
-    weight->size[0], -1,
-    weight->size[2], -1);
-  // This makes a contiguous tensor from weight_viewT, i.e. does the actual transpose
-  THCTensor_(copy)(state, columns_weightT, weight_viewT);
-  // Copy the transposed data back
-  THCTensor_(copy)(state, weight, columns_weightT);
-
-  // Now reshape weight to be (nInputPlane) x (nOutputPlane) x (outputWidth * outputHeight)
-  THCTensor *weightT = THCTensor_(newWithStorage3d)(
-    state, weight->storage, weight->storageOffset,
-    weight->size[1], -1,
-    weight->size[0], -1,
-    weight->size[2], -1);
+  transposeWithBuffer(state, weight, columns->storage, 0, 1);
 
   // Helpers
   THCTensor *input_n = THCTensor_(new)(state);
@@ -167,24 +170,24 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
 
   // I'd love to use nullptr but someone might be using a medieval compiler
   const real **columns_batches = NULL;
-  const real **weightT_batches = NULL;
+  const real **weight_batches = NULL;
   real **output_batches        = NULL;
   THCudaCheck(cudaMalloc(&columns_batches,  sizeof(real*) * nInputPlane));
-  THCudaCheck(cudaMalloc(&weightT_batches,  sizeof(real*) * nInputPlane));
+  THCudaCheck(cudaMalloc(&weight_batches,  sizeof(real*) * nInputPlane));
   THCudaCheck(cudaMalloc(&output_batches, sizeof(real*) * batchSize*nInputPlane));
   std::vector<real*> columns_batches_host (nInputPlane);
-  std::vector<real*> weightT_batches_host (nInputPlane);
+  std::vector<real*> weight_batches_host (nInputPlane);
   std::vector<real*> output_n_batches_host(batchSize*nInputPlane);
   for (int k = 0; k < nInputPlane; ++k) {
     columns_batches_host[k] = THCTensor_(data)(state, columns) + k * columns->stride[0];
-    weightT_batches_host[k] = THCTensor_(data)(state, weightT) + k * weightT->stride[0];
+    weight_batches_host[k] = THCTensor_(data)(state, weight) + k * weight->stride[0];
   }
   for (int k = 0; k < output_n_batches_host.size(); ++k) {
     output_n_batches_host[k] = THCTensor_(data)(state, output) + k * output->stride[1];
   }
   THCudaCheck(cudaMemcpy(columns_batches, columns_batches_host.data(), 
     sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice));
-  THCudaCheck(cudaMemcpy(weightT_batches, weightT_batches_host.data(), 
+  THCudaCheck(cudaMemcpy(weight_batches, weight_batches_host.data(), 
     sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice));
   THCudaCheck(cudaMemcpy(output_batches, output_n_batches_host.data(), 
       sizeof(real*)*batchSize*nInputPlane, cudaMemcpyHostToDevice));
@@ -234,7 +237,7 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
         n, m, k,
         ScalarConvert<int, real>::to(1),
         columns_batches, n,
-        weightT_batches, k,
+        weight_batches, k,
         ScalarConvert<int, real>::to(1),
         output_n_batches, n,
         nInputPlane
@@ -242,31 +245,14 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
     #endif
   }
 
-  // Transpose weight back using temporary `columns` tensor's space.
-  THCTensor *columns_weight = THCTensor_(newWithStorage3d)(
-    state, columns->storage, 0,
-    weight->size[0], -1,
-    weight->size[1], -1,
-    weight->size[2], -1);
-  THCTensor *weightT_viewT = THCTensor_(newTranspose)(state, weightT, 0, 1);
-  // This makes a contiguous tensor from weight_viewT, i.e. does the actual transpose
-  THCTensor_(copy)(state, columns_weight, weightT_viewT);
-  // Copy the transposed data back
-  THCTensor_(copy)(state, weight, columns_weight);
+  transposeWithBuffer(state, weight, columns->storage, 0, 1);
 
   // Free
   THCTensor_(free)(state, input_n);
   THCTensor_(free)(state, output_n);
 
-  THCTensor_(free)(state, weight);
-  THCTensor_(free)(state, weight_viewT);
-  THCTensor_(free)(state, weightT);
-  THCTensor_(free)(state, weightT_viewT);
-  THCTensor_(free)(state, columns_weight);
-  THCTensor_(free)(state, columns_weightT);
-
   THCudaCheck(cudaFree(columns_batches));
-  THCudaCheck(cudaFree(weightT_batches));
+  THCudaCheck(cudaFree(weight_batches));
   THCudaCheck(cudaFree(output_batches));
 
   // Transpose output
@@ -328,35 +314,7 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
   THNN_(SpatialDepthWiseConvolution_shapeCheck)
        (state, input, gradOutput, weight, NULL, kH, kW, dH, dW, padH, padW);
 
-  // Reshape weight to be (nOutputPlane) x (nInputPlane) x (outputWidth * outputHeight)
-  weight = THCTensor_(newWithStorage3d)(
-    state, weight->storage, weight->storageOffset,
-    weight->size[0], -1,
-    weight->size[1], -1,
-    weight->size[2] * weight->size[3], -1);
-
-  // Transpose weight using temporary `gradColumns` tensor's space
-  THCTensor *weight_viewT = THCTensor_(newTranspose)(state, weight, 0, 1);
-  // Size of `gradColumns` should be enough in general, but who knows, so make sure
-  if (gradColumns->storage->size < nInputPlane*nOutputPlane*kW*kH) {
-    THCStorage_(resize)(state, gradColumns->storage, nInputPlane*nOutputPlane*kW*kH);
-  }
-  THCTensor *columns_weightT = THCTensor_(newWithStorage3d)(
-    state, gradColumns->storage, 0,
-    weight->size[1], -1,
-    weight->size[0], -1,
-    weight->size[2], -1);
-  // This makes a contiguous tensor from weight_viewT, i.e. does the actual transpose
-  THCTensor_(copy)(state, columns_weightT, weight_viewT);
-  // Copy the transposed data back
-  THCTensor_(copy)(state, weight, columns_weightT);
-
-  // Now reshape weight to be (nInputPlane) x (nOutputPlane) x (outputWidth * outputHeight)
-  THCTensor *weightT = THCTensor_(newWithStorage3d)(
-    state, weight->storage, weight->storageOffset,
-    weight->size[1], -1,
-    weight->size[0], -1,
-    weight->size[2], -1);
+  transposeWithBuffer(state, weight, gradColumns->storage, 0, 1);
 
   input = THCTensor_(newContiguous)(state, input);
 
@@ -383,37 +341,37 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
   THCTensor_(resize3d)(state, gradColumns, nInputPlane, kW*kH, outputHeight*outputWidth);
 
   // Helpers
-  THCTensor *gradInput_n = THCTensor_(new)(state);
+  THCTensor *gradInput_n  = THCTensor_(new)(state);
   THCTensor *gradOutput_n = THCTensor_(new)(state);
 
   // Helpers for DepthWiseConvolution
-  THCTensor *gradOutput_i = THCTensor_(new)(state);
-  THCTensor *gradInput_i = THCTensor_(new)(state);
-  THCTensor *weight_i = THCTensor_(new)(state);
+  THCTensor *gradOutput_i  = THCTensor_(new)(state);
+  THCTensor *gradInput_i   = THCTensor_(new)(state);
+  THCTensor *weight_i      = THCTensor_(new)(state);
   THCTensor *gradColumns_i = THCTensor_(new)(state);
 
   // For cublas<t>gemmBatched
 
   // I'd love to use nullptr but someone might be using a medieval compiler
-  const real **weightT_batches    = NULL;
+  const real **weight_batches     = NULL;
   const real **gradOutput_batches = NULL;
   real **columns_batches          = NULL;
   THCudaCheck(cudaMalloc(&columns_batches,    sizeof(real*) * nInputPlane));
-  THCudaCheck(cudaMalloc(&weightT_batches,    sizeof(real*) * nInputPlane));
+  THCudaCheck(cudaMalloc(&weight_batches,     sizeof(real*) * nInputPlane));
   THCudaCheck(cudaMalloc(&gradOutput_batches, sizeof(real*) * batchSize*nInputPlane));
-  std::vector<real*> columns_batches_host (nInputPlane);
-  std::vector<real*> weightT_batches_host (nInputPlane);
+  std::vector<real*>      columns_batches_host(nInputPlane);
+  std::vector<real*>       weight_batches_host(nInputPlane);
   std::vector<real*> gradOutput_n_batches_host(batchSize*nInputPlane);
   for (int k = 0; k < nInputPlane; ++k) {
     columns_batches_host[k] = THCTensor_(data)(state, gradColumns) + k * gradColumns->stride[0];
-    weightT_batches_host[k] = THCTensor_(data)(state, weightT) + k * weightT->stride[0];
+    weight_batches_host[k] = THCTensor_(data)(state, weight) + k * weight->stride[0];
   }
   for (int k = 0; k < gradOutput_n_batches_host.size(); ++k) {
     gradOutput_n_batches_host[k] = THCTensor_(data)(state, gradOutput) + k * gradOutput->stride[1];
   }
   THCudaCheck(cudaMemcpy(columns_batches, columns_batches_host.data(), 
     sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice));
-  THCudaCheck(cudaMemcpy(weightT_batches, weightT_batches_host.data(), 
+  THCudaCheck(cudaMemcpy(weight_batches, weight_batches_host.data(), 
     sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice));
   THCudaCheck(cudaMemcpy(gradOutput_batches, gradOutput_n_batches_host.data(), 
     sizeof(real*)*batchSize*nInputPlane, cudaMemcpyHostToDevice));
@@ -441,7 +399,7 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
           n, m, k,
           ScalarConvert<int, real>::to(1),
           gradOutput_n_batches, n,
-          weightT_batches, m,
+          weight_batches, m,
           ScalarConvert<int, real>::to(0),
           columns_batches, n,
           nInputPlane
@@ -457,32 +415,15 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
     );
   }
 
-  // Transpose weight back using temporary `gradColumns` tensor's space.
-  THCTensor *columns_weight = THCTensor_(newWithStorage3d)(
-    state, gradColumns->storage, 0,
-    weight->size[0], -1,
-    weight->size[1], -1,
-    weight->size[2], -1);
-  THCTensor *weightT_viewT = THCTensor_(newTranspose)(state, weightT, 0, 1);
-  // This makes a contiguous tensor from weight_viewT, i.e. does the actual transpose
-  THCTensor_(copy)(state, columns_weight, weightT_viewT);
-  // Copy the transposed data back
-  THCTensor_(copy)(state, weight, columns_weight);
+  transposeWithBuffer(state, weight, gradColumns->storage, 0, 1);
 
   // Free
   THCTensor_(free)(state, gradInput_n);
   THCTensor_(free)(state, gradOutput_n);
 
   THCudaCheck(cudaFree(columns_batches));
-  THCudaCheck(cudaFree(weightT_batches));
+  THCudaCheck(cudaFree(weight_batches));
   THCudaCheck(cudaFree(gradOutput_batches));
-
-  THCTensor_(free)(state, weight);
-  THCTensor_(free)(state, weight_viewT);
-  THCTensor_(free)(state, weightT);
-  THCTensor_(free)(state, weightT_viewT);
-  THCTensor_(free)(state, columns_weight);
-  THCTensor_(free)(state, columns_weightT);
 
   // Resize output
   if (batch == 0) {
@@ -538,35 +479,7 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   THNN_(SpatialDepthWiseConvolution_shapeCheck)
        (state, input, gradOutput, gradWeight, gradBias, kH, kW, dH, dW, padH, padW);
 
-  // Reshape gradWeight to be (nOutputPlane) x (nInputPlane) x (outputWidth * outputHeight)
-  gradWeight = THCTensor_(newWithStorage3d)(
-    state, gradWeight->storage, gradWeight->storageOffset,
-    gradWeight->size[0], -1,
-    gradWeight->size[1], -1,
-    gradWeight->size[2] * gradWeight->size[3], -1);
-
-  // Transpose gradWeight using temporary `columns` tensor's space
-  THCTensor *gradWeight_viewT = THCTensor_(newTranspose)(state, gradWeight, 0, 1);
-  // Size of `columns` should be enough in general, but who knows, so make sure
-  if (columns->storage->size < nInputPlane*nOutputPlane*kW*kH) {
-    THCStorage_(resize)(state, columns->storage, nInputPlane*nOutputPlane*kW*kH);
-  }
-  THCTensor *columns_gradWeightT = THCTensor_(newWithStorage3d)(
-    state, columns->storage, 0,
-    gradWeight->size[1], -1,
-    gradWeight->size[0], -1,
-    gradWeight->size[2], -1);
-  // This makes a contiguous tensor from gradWeight_viewT, i.e. does the actual transpose
-  THCTensor_(copy)(state, columns_gradWeightT, gradWeight_viewT);
-  // Copy the transposed data back
-  THCTensor_(copy)(state, gradWeight, columns_gradWeightT);
-
-  // Now reshape gradWeightT to be (nInputPlane) x (nOutputPlane) x (outputWidth * outputHeight)
-  THCTensor *gradWeightT = THCTensor_(newWithStorage3d)(
-    state, gradWeight->storage, gradWeight->storageOffset,
-    gradWeight->size[1], -1,
-    gradWeight->size[0], -1,
-    gradWeight->size[2], -1);
+  transposeWithBuffer(state, gradWeight, columns->storage, 0, 1);
 
   input = THCTensor_(newContiguous)(state, input);
 
@@ -603,7 +516,7 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   // Helpers for DepthWiseConvolution
   THCTensor *gradOutput_i = THCTensor_(new)(state);
   THCTensor *input_i = THCTensor_(new)(state);
-  THCTensor *gradWeightT_i = THCTensor_(new)(state);
+  THCTensor *gradWeight_i = THCTensor_(new)(state);
   THCTensor *columns_i = THCTensor_(new)(state);
 
   // For cublas<t>gemmBatched
@@ -611,23 +524,23 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   // I'd love to use nullptr but someone might be using a medieval compiler
   const real **columns_batches     = NULL;
   const real **gradOutput_batches  = NULL;
-  real **gradWeightT_batches       = NULL;
+  real **gradWeight_batches       = NULL;
   THCudaCheck(cudaMalloc(&columns_batches,     sizeof(real*) * nInputPlane));
-  THCudaCheck(cudaMalloc(&gradWeightT_batches, sizeof(real*) * nInputPlane));
+  THCudaCheck(cudaMalloc(&gradWeight_batches, sizeof(real*) * nInputPlane));
   THCudaCheck(cudaMalloc(&gradOutput_batches,  sizeof(real*) * batchSize*nInputPlane));
   std::vector<real*> columns_batches_host     (nInputPlane);
-  std::vector<real*> gradWeightT_batches_host (nInputPlane);
+  std::vector<real*> gradWeight_batches_host (nInputPlane);
   std::vector<real*> gradOutput_n_batches_host(batchSize*nInputPlane);
   for (int k = 0; k < nInputPlane; ++k) {
     columns_batches_host[k] = THCTensor_(data)(state, columns) + k * columns->stride[0];
-    gradWeightT_batches_host[k] = THCTensor_(data)(state, gradWeightT) + k * gradWeightT->stride[0];
+    gradWeight_batches_host[k] = THCTensor_(data)(state, gradWeight) + k * gradWeight->stride[0];
   }
   for (int k = 0; k < gradOutput_n_batches_host.size(); ++k) {
     gradOutput_n_batches_host[k] = THCTensor_(data)(state, gradOutput) + k * gradOutput->stride[1];
   }
   THCudaCheck(cudaMemcpy(columns_batches, columns_batches_host.data(),
     sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice));
-  THCudaCheck(cudaMemcpy(gradWeightT_batches, gradWeightT_batches_host.data(),
+  THCudaCheck(cudaMemcpy(gradWeight_batches, gradWeight_batches_host.data(),
     sizeof(real*)*nInputPlane, cudaMemcpyHostToDevice));
   THCudaCheck(cudaMemcpy(gradOutput_batches, gradOutput_n_batches_host.data(),
       sizeof(real*)*batchSize*nInputPlane, cudaMemcpyHostToDevice));
@@ -705,23 +618,13 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
           columns_batches, k,
           gradOutput_n_batches, k,
           ScalarConvert<int, real>::to(1),
-          gradWeightT_batches, n,
+          gradWeight_batches, n,
           nInputPlane
       );
     #endif
   }
 
-  // Transpose gradWeight back using temporary `columns` tensor's space.
-  THCTensor *columns_gradWeight = THCTensor_(newWithStorage3d)(
-    state, columns->storage, 0,
-    gradWeight->size[0], -1,
-    gradWeight->size[1], -1,
-    gradWeight->size[2], -1);
-  THCTensor *gradWeightT_viewT = THCTensor_(newTranspose)(state, gradWeightT, 0, 1);
-  // This makes a contiguous tensor from weight_viewT, i.e. does the actual transpose
-  THCTensor_(copy)(state, columns_gradWeight, gradWeightT_viewT);
-  // Copy the transposed data back
-  THCTensor_(copy)(state, gradWeight, columns_gradWeight);
+  transposeWithBuffer(state, gradWeight, columns->storage, 0, 1);
 
   // Free
   THCTensor_(free)(state, input_n);
@@ -729,17 +632,9 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   THCTensor_(free)(state, input_i);
   THCTensor_(free)(state, gradOutput_i);
   THCTensor_(free)(state, columns_i);
-  
-  THCTensor_(free)(state, gradWeight);
-  THCTensor_(free)(state, gradWeight_viewT);
-  THCTensor_(free)(state, gradWeightT);
-  THCTensor_(free)(state, gradWeightT_viewT);
-  THCTensor_(free)(state, columns_gradWeight);
-  THCTensor_(free)(state, columns_gradWeightT);
-  THCTensor_(free)(state, gradWeightT_i);
 
   THCudaCheck(cudaFree(columns_batches));
-  THCudaCheck(cudaFree(gradWeightT_batches));
+  THCudaCheck(cudaFree(gradWeight_batches));
   THCudaCheck(cudaFree(gradOutput_batches));
 
   // Resize
