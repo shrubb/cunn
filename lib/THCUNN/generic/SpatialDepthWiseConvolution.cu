@@ -480,6 +480,7 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
        (state, input, gradOutput, gradWeight, gradBias, kH, kW, dH, dW, padH, padW);
 
   transposeWithBuffer(state, gradWeight, columns->storage, 0, 1);
+  transposeWithBuffer(state, gradBias  , columns->storage, 0, 1);
 
   input = THCTensor_(newContiguous)(state, input);
 
@@ -513,23 +514,17 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   THCTensor *input_n = THCTensor_(new)(state);
   THCTensor *gradOutput_n = THCTensor_(new)(state);
 
-  // Helpers for DepthWiseConvolution
-  THCTensor *gradOutput_i = THCTensor_(new)(state);
-  THCTensor *input_i = THCTensor_(new)(state);
-  THCTensor *gradWeight_i = THCTensor_(new)(state);
-  THCTensor *columns_i = THCTensor_(new)(state);
-
   // For cublas<t>gemmBatched
 
   // I'd love to use nullptr but someone might be using a medieval compiler
   const real **columns_batches     = NULL;
   const real **gradOutput_batches  = NULL;
-  real **gradWeight_batches       = NULL;
+  real **gradWeight_batches        = NULL;
   THCudaCheck(cudaMalloc(&columns_batches,     sizeof(real*) * nInputPlane));
-  THCudaCheck(cudaMalloc(&gradWeight_batches, sizeof(real*) * nInputPlane));
+  THCudaCheck(cudaMalloc(&gradWeight_batches,  sizeof(real*) * nInputPlane));
   THCudaCheck(cudaMalloc(&gradOutput_batches,  sizeof(real*) * batchSize*nInputPlane));
   std::vector<real*> columns_batches_host     (nInputPlane);
-  std::vector<real*> gradWeight_batches_host (nInputPlane);
+  std::vector<real*> gradWeight_batches_host  (nInputPlane);
   std::vector<real*> gradOutput_n_batches_host(batchSize*nInputPlane);
   for (int k = 0; k < nInputPlane; ++k) {
     columns_batches_host[k] = THCTensor_(data)(state, columns) + k * columns->stride[0];
@@ -625,13 +620,11 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   }
 
   transposeWithBuffer(state, gradWeight, columns->storage, 0, 1);
+  transposeWithBuffer(state, gradBias  , columns->storage, 0, 1);
 
   // Free
   THCTensor_(free)(state, input_n);
-  THCTensor_(free)(state, gradOutput_n);
-  THCTensor_(free)(state, input_i);
-  THCTensor_(free)(state, gradOutput_i);
-  THCTensor_(free)(state, columns_i);
+  THCTensor_(free)(state, gradOutput_n);;
 
   THCudaCheck(cudaFree(columns_batches));
   THCudaCheck(cudaFree(gradWeight_batches));
