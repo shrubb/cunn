@@ -95,7 +95,7 @@ __global__ void im2col_depthwise_kernel(const int n, const Dtype* data_im,
         int w = w_in + j * dilation_w;
         *data_col = (h >= 0 && w >= 0 && h < height && w < width) ?
           data_im[i * dilation_h * width + j * dilation_w] : ScalarConvert<int, Dtype>::to(0);
-        data_col += nInputPlane * height_col * width_col;
+        data_col += batch_size * height_col * width_col;
       }
     }
   }
