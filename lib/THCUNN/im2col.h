@@ -60,7 +60,7 @@ void im2col(cudaStream_t stream, const Dtype* data_im, const int channels,
   THCudaCheck(cudaGetLastError());
 }
 
-// im2col version for SpatialDepthWiseConvolution's accGradParameters.
+// im2col version for SpatialDepthWiseConvolution.
 // Similar to im2col, but the output matrix is `batch_size` blocks of
 // size (kW*kH) x (h_out*w_out) concatenated over the SECOND dimension,
 // where the i-th block is the result of `im2col` of the `inPlaneIdx`-th
