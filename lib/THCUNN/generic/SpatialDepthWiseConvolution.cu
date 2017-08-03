@@ -7,8 +7,8 @@
 
 // Helper for `updateOutput`. Fills `outputTransposed` with constant (bias) values
 __global__ void fillOutputTransposedWithBias(
-  real *outputTransposed, int batchSize, int elementsPerPlane,
-  real *bias, int nInputPlane, int nOutputPlane) {
+  real *outputTransposed, const int batchSize, const int elementsPerPlane,
+  const real *bias, const int nInputPlane, const int nOutputPlane) {
 
   // `outputTransposed` is of size
   // (nInputPlane) x (nOutputPlane) x (batchSize) x (outputHeight*outputWidth)
@@ -26,11 +26,34 @@ __global__ void fillOutputTransposedWithBias(
   }
 }
 
+// Helper for `updateOutput`. Fills `outputTransposed` with constant (bias) values
+__global__ void fillOutputWithBias(
+  real *output, const int batchSize, const int elementsPerPlane,
+  const real *bias, const int nInputPlane, const int nOutputPlane) {
+
+  // `output` is of size
+  // (nInputPlane) x (nOutputPlane) x (batchSize) x (outputHeight*outputWidth)
+  // (batchSize) x (nInputPlane) x (nOutputPlane) x (outputHeight*outputWidth)
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (index < batchSize * nInputPlane * nOutputPlane * elementsPerPlane) {
+    real *outputPixel = &output[index];
+
+    index /= elementsPerPlane; index %= nInputPlane * nOutputPlane; // index of the output channel
+    int outPlaneIdx = index % nOutputPlane;
+    int  inPlaneIdx = index / nOutputPlane;
+
+    // bias is of size (nOutputPlane) x (nInputPlane)
+    *outputPixel = bias[outPlaneIdx*nInputPlane + inPlaneIdx];
+  }
+}
+
 // Transposes `tensor` pseudo-in-place using `buffer`.
 // `buffer` is enlarged if needed.
 // This function REQUIRES `buffer` to be non-NULL.
 void transposeWithBuffer(
-  THCState *state, THCTensor *tensor, THCStorage *buffer, int dim1, int dim2) {
+  THCState *state, THCTensor *tensor, THCStorage *buffer,
+  const int dim1, const int dim2) {
 
   THAssert(buffer != NULL);
 
@@ -62,7 +85,7 @@ void transposeWithBuffer(
 // :copy(T:transpose(0,1):transpose(1,2)) works 1.5-2 times slower.
 // 2-0-1 transpose:
 __global__ void invTransposeOutput(
-  real *output, real *outputTransposed, int batchSize, 
+  real *output, const real *outputTransposed, int batchSize, 
   int nInputPlane, int nOutputPlane, int elementsPerPlane) {
 
   // outputTransposed is (nInputPlane) x (nOutputPlane) x (batchSize) x (h) x (w)
@@ -93,7 +116,7 @@ __global__ void invTransposeOutput(
 
 // 1-2-0 transpose:
 __global__ void transposeGradOutput(
-  real *gradOutputTransposed, real *gradOutput, int batchSize, 
+  real *gradOutputTransposed, const real *gradOutput, int batchSize, 
   int nInputPlane, int nOutputPlane, int elementsPerPlane) {
 
   // gradOutput           is (batchSize) x (nInputPlane) x (nOutputPlane) x (h) x (w)
@@ -176,6 +199,57 @@ static inline void THNN_(SpatialDepthWiseConvolution_shapeCheck)(
   }
 }
 
+__global__ void updateOutputKernel(
+      real *output, const real *input, const real *weight, const int batchSize,
+      const int inputHeight , const int inputWidth  ,
+      const int nInputPlane , const int nOutputPlane,
+      const int outputHeight, const int outputWidth ,
+      const int kH          , const int kW          ,
+      const int padH        , const int padW        ,
+      const int strideH     , const int strideW     ,
+      const int dilationH   , const int dilationW) {
+
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (index < batchSize * nInputPlane * nOutputPlane * outputHeight * outputWidth) {
+
+    const int outIndex = index;
+    // grid is (batchSize) x (nInputPlane) x (nOutputPlane) x (outputHeight) x (outputWidth)
+    const int wOut        = index % outputWidth ; index /= outputWidth ;
+    const int hOut        = index % outputHeight; index /= outputHeight;
+    const int outPlaneIdx = index % nOutputPlane; index /= nOutputPlane;
+    const int inPlaneIdx  = index % nInputPlane ; index /= nInputPlane ;
+    // `index` is now the index of the sample in batch
+    const int & sampleIdx = index;
+
+    const int hInStart = hOut * strideH - padH;
+    const int wInStart = wOut * strideW - padW;
+    input += ((sampleIdx 
+      * nInputPlane + inPlaneIdx)
+        * inputHeight + hInStart) 
+          * inputWidth + wInStart;
+
+    // weight is (nInputPlane) x (nOutputPlane) x (kH) x (kW)
+    weight += (inPlaneIdx * nOutputPlane + outPlaneIdx) * kH * kW;
+
+    accreal result = 0;
+
+    for (int i = 0; i < kH; ++i) {
+      for (int j = 0; j < kW; ++j) {
+        const int h = hInStart + i * dilationH;
+        const int w = wInStart + j * dilationW;
+        result += 
+          (h >= 0 && w >= 0 && h < inputHeight && w < inputWidth) ?
+          input[i * dilationH * inputWidth + j * dilationW] * (*weight) :
+          ScalarConvert<int, real>::to(0);
+        ++weight;
+      }
+    }
+
+    output[outIndex] += ScalarConvert<accreal, real>::to(result);
+  }
+}
+
 void THNN_(SpatialDepthWiseConvolution_updateOutput)(
            THCState *state,
            THCTensor *input,
@@ -238,16 +312,25 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
 
   // Do bias first (fill the output)
   if (bias) {
-    fillOutputTransposedWithBias
-      <<<GET_BLOCKS(batchSize*outputHeight*outputWidth*nInputPlane*nOutputPlane), 
+    // fillOutputTransposedWithBias
+    fillOutputWithBias
+      <<<GET_BLOCKS(batchSize*nInputPlane*nOutputPlane*outputHeight*outputWidth), 
       CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>> (
-        THCTensor_(data)(state, outputTransposed), batchSize, outputHeight*outputWidth,
+        THCTensor_(data)(state, output), batchSize, outputHeight*outputWidth,
         THCTensor_(data)(state, bias), nInputPlane, nOutputPlane);
     THCudaCheck(cudaGetLastError());
   } else {
     THCTensor_(zero)(state, output);
   }
 
+  updateOutputKernel <<<GET_BLOCKS(THCTensor_(nElement)(state, output)), 
+                        CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>>(
+      THCTensor_(data)(state, output), THCTensor_(data)(state, input),
+      THCTensor_(data)(state, weight), batchSize,
+      inputHeight, inputWidth, nInputPlane, nOutputPlane, 
+      outputHeight, outputWidth, kH, kW, padH, padW, dH, dW, 1, 1);
+  THCudaCheck(cudaGetLastError());
+/*
   for (int inPlaneIdx = 0; inPlaneIdx < nInputPlane; ++inPlaneIdx) {
     // Matrix mulitply per output:
     THCTensor_(select)(state, weight_i, weight, 0, inPlaneIdx);
@@ -293,7 +376,7 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
         THCTensor_(data)(state, output), THCTensor_(data)(state, outputTransposed),
         batchSize, nInputPlane, nOutputPlane, outputHeight*outputHeight);
   THCudaCheck(cudaGetLastError());
-
+*/
   // transpose back
   transposeWithBuffer(state, weight, columns->storage, 0, 1);
 

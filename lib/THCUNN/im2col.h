@@ -7,14 +7,15 @@
 // Kernel for fast unfold+copy
 // (borrowed from Caffe: https://github.com/BVLC/caffe/blob/master/src/caffe/layers/conv_layer.cu)
 template <typename Dtype>
-__global__ void im2col_kernel(const int n, const Dtype* data_im,
-                              const int height, const int width,
-                              const int ksize_h, const int ksize_w,
-                              const int pad_h, const int pad_w,
-                              const int stride_h, const int stride_w,
-                              const int dilation_h, const int dilation_w,
-                              const int height_col, const int width_col,
-                              Dtype* data_col) {
+__global__ void im2col_kernel(
+      const int n, const Dtype* data_im,
+      const int height, const int width,
+      const int ksize_h, const int ksize_w,
+      const int pad_h, const int pad_w,
+      const int stride_h, const int stride_w,
+      const int dilation_h, const int dilation_w,
+      const int height_col, const int width_col,
+      Dtype* data_col) {
   CUDA_KERNEL_LOOP(index, n) {
     int w_out = index % width_col;
     index /= width_col;
@@ -38,11 +39,12 @@ __global__ void im2col_kernel(const int n, const Dtype* data_im,
 }
 
 template <typename Dtype>
-void im2col(cudaStream_t stream, const Dtype* data_im, const int channels,
-            const int height, const int width,
-            const int ksize_h, const int ksize_w, const int pad_h,
-            const int pad_w, const int stride_h, const int stride_w,
-            const int dilation_h, const int dilation_w, Dtype* data_col) {
+void im2col(
+      cudaStream_t stream, const Dtype* data_im, const int channels,
+      const int height, const int width,
+      const int ksize_h, const int ksize_w, const int pad_h,
+      const int pad_w, const int stride_h, const int stride_w,
+      const int dilation_h, const int dilation_w, Dtype* data_col) {
   // We are going to launch channels * height_col * width_col kernels, each
   // kernel responsible for copying a single-channel grid.
   int height_col = (height + 2 * pad_h - (dilation_h * (ksize_h - 1) + 1))
@@ -68,16 +70,16 @@ void im2col(cudaStream_t stream, const Dtype* data_im, const int channels,
 // `data_col` must be able to accomodate (kW*kH) x (batch_size*h_out*w_out) elements.
 template <typename Dtype>
 __global__ void im2col_depthwise_kernel(
-                              const int n, const Dtype* data_im,
-                              const int batch_size,
-                              const int nInputPlane, const int inPlaneIdx,
-                              const int height, const int width,
-                              const int ksize_h, const int ksize_w,
-                              const int pad_h, const int pad_w,
-                              const int stride_h, const int stride_w,
-                              const int dilation_h, const int dilation_w,
-                              const int height_col, const int width_col,
-                              Dtype* data_col) {
+      const int n, const Dtype* data_im,
+      const int batch_size,
+      const int nInputPlane, const int inPlaneIdx,
+      const int height, const int width,
+      const int ksize_h, const int ksize_w,
+      const int pad_h, const int pad_w,
+      const int stride_h, const int stride_w,
+      const int dilation_h, const int dilation_w,
+      const int height_col, const int width_col,
+      Dtype* data_col) {
   CUDA_KERNEL_LOOP(index, n) {
     int w_out = index % width_col;
     index /= width_col;
@@ -239,11 +241,12 @@ __global__ void col2im_depthwise_kernel(
           h_k /= dilation_h;
           w_k /= dilation_w;
           int data_col_index =
-            h_k * kernel_w * batch_size * height_col * width_col +
-                       w_k * batch_size * height_col * width_col +
-                                   c_im * height_col * width_col +
-                                               h_col * width_col +
-                                                           w_col;
+            (((h_k * kernel_w + w_k) * batch_size + c_im) * height_col + h_col) * width_col + w_col;
+            // h_k * kernel_w * batch_size * height_col * width_col +
+            //            w_k * batch_size * height_col * width_col +
+            //                        c_im * height_col * width_col +
+            //                                    h_col * width_col +
+            //                                                w_col;
           val += data_col[data_col_index];
         }
       }
