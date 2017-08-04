@@ -5,34 +5,12 @@
 #include "common.h"
 #include <vector>
 
-// Helper for `updateOutput`. Fills `outputTransposed` with constant (bias) values
-__global__ void fillOutputTransposedWithBias(
-  real *outputTransposed, const int batchSize, const int elementsPerPlane,
-  const real *bias, const int nInputPlane, const int nOutputPlane) {
-
-  // `outputTransposed` is of size
-  // (nInputPlane) x (nOutputPlane) x (batchSize) x (outputHeight*outputWidth)
-  int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (index < nInputPlane * nOutputPlane * batchSize * elementsPerPlane) {
-    real *outputPixel = &outputTransposed[index];
-
-    index /= (batchSize * elementsPerPlane); // index of the output channel
-    int outPlaneIdx = index % nOutputPlane;
-    int  inPlaneIdx = index / nOutputPlane;
-
-    // bias is of size (nOutputPlane) x (nInputPlane)
-    *outputPixel = bias[outPlaneIdx*nInputPlane + inPlaneIdx];
-  }
-}
-
-// Helper for `updateOutput`. Fills `outputTransposed` with constant (bias) values
+// Helper for `updateOutput`. Fills `output` with constant (bias) values
 __global__ void fillOutputWithBias(
   real *output, const int batchSize, const int elementsPerPlane,
   const real *bias, const int nInputPlane, const int nOutputPlane) {
 
   // `output` is of size
-  // (nInputPlane) x (nOutputPlane) x (batchSize) x (outputHeight*outputWidth)
   // (batchSize) x (nInputPlane) x (nOutputPlane) x (outputHeight*outputWidth)
   int index = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -78,72 +56,6 @@ void transposeWithBuffer(
 
   THCTensor_(free)(state, tensor_viewT);
   THCTensor_(free)(state, bufferTensorT);
-}
-
-// Two helper functions for complex tensor transpose.
-// Using this kernel because, for some reason,
-// :copy(T:transpose(0,1):transpose(1,2)) works 1.5-2 times slower.
-// 2-0-1 transpose:
-__global__ void invTransposeOutput(
-  real *output, const real *outputTransposed, int batchSize, 
-  int nInputPlane, int nOutputPlane, int elementsPerPlane) {
-
-  // outputTransposed is (nInputPlane) x (nOutputPlane) x (batchSize) x (h) x (w)
-  // output           is (batchSize) x (nInputPlane) x (nOutputPlane) x (h) x (w)
-  int index = blockIdx.x * blockDim.x + threadIdx.x;
-  
-  if (index < batchSize * nInputPlane * nOutputPlane * elementsPerPlane) { 
-    int pixelIdx = index % elementsPerPlane; // index of a pixel in the plane
-    index /= elementsPerPlane;
-    int outPlaneIdx = index % nOutputPlane;
-    index /= nOutputPlane;
-    int inPlaneIdx = index % nInputPlane;
-    index /= nInputPlane; // `index` is now the index of a sample in batch
-
-    output[
-      elementsPerPlane * nOutputPlane * nInputPlane * index +
-      elementsPerPlane * nOutputPlane * inPlaneIdx +
-      elementsPerPlane * outPlaneIdx +
-      pixelIdx] =
-
-    outputTransposed[
-      elementsPerPlane * batchSize * nOutputPlane * inPlaneIdx +
-      elementsPerPlane * batchSize * outPlaneIdx +
-      elementsPerPlane * index +
-      pixelIdx];
-  }
-}
-
-// 1-2-0 transpose:
-__global__ void transposeGradOutput(
-  real *gradOutputTransposed, const real *gradOutput, int batchSize, 
-  int nInputPlane, int nOutputPlane, int elementsPerPlane) {
-
-  // gradOutput           is (batchSize) x (nInputPlane) x (nOutputPlane) x (h) x (w)
-  // gradOutputTransposed is (nInputPlane) x (nOutputPlane) x (batchSize) x (h) x (w)
-
-  int index = blockIdx.x * blockDim.x + threadIdx.x;
-  
-  if (index < batchSize * nInputPlane * nOutputPlane * elementsPerPlane) { 
-    int pixelIdx = index % elementsPerPlane; // index of a pixel in the plane
-    index /= elementsPerPlane;
-    int outPlaneIdx = index % nOutputPlane;
-    index /= nOutputPlane;
-    int inPlaneIdx = index % nInputPlane;
-    index /= nInputPlane; // `index` is now the index of a sample in batch
-
-    gradOutputTransposed[
-      elementsPerPlane * batchSize * nOutputPlane * inPlaneIdx +
-      elementsPerPlane * batchSize * outPlaneIdx +
-      elementsPerPlane * index +
-      pixelIdx] =
-
-    gradOutput[
-      elementsPerPlane * nOutputPlane * nInputPlane * index +
-      elementsPerPlane * nOutputPlane * inPlaneIdx +
-      elementsPerPlane * outPlaneIdx +
-      pixelIdx];
-  }
 }
 
 static inline void THNN_(SpatialDepthWiseConvolution_shapeCheck)(
@@ -200,7 +112,8 @@ static inline void THNN_(SpatialDepthWiseConvolution_shapeCheck)(
 }
 
 __global__ void updateOutputKernel(
-      real *output, const real *input, const real *weight, const int batchSize,
+      real *output          , const real *input     , 
+      const real *weight    , const int batchSize   ,
       const int inputHeight , const int inputWidth  ,
       const int nInputPlane , const int nOutputPlane,
       const int outputHeight, const int outputWidth ,
@@ -297,7 +210,7 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
   // Resize output
   THCTensor_(resize5d)(state, output, batchSize, nInputPlane, nOutputPlane, outputHeight, outputWidth);
   // Resize temporary columns
-  THCTensor_(resize3d)(state, columns, kW*kH, batchSize, outputHeight*outputWidth);
+  THCTensor_(resizeAs)(state, columns, weight); // reserve size for transpose
 
   transposeWithBuffer(state, weight, columns->storage, 0, 1);
 
@@ -330,53 +243,7 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
       inputHeight, inputWidth, nInputPlane, nOutputPlane, 
       outputHeight, outputWidth, kH, kW, padH, padW, dH, dW, 1, 1);
   THCudaCheck(cudaGetLastError());
-/*
-  for (int inPlaneIdx = 0; inPlaneIdx < nInputPlane; ++inPlaneIdx) {
-    // Matrix mulitply per output:
-    THCTensor_(select)(state, weight_i, weight, 0, inPlaneIdx);
-    THCTensor_(select)(state, outputTransposed_i, outputTransposed, 0, inPlaneIdx);
 
-    im2col_depthwise(
-      THCState_getCurrentStream(state),
-      THCTensor_(data)(state, input), batchSize, nInputPlane,
-      inPlaneIdx, inputHeight, inputWidth, kH, kW, padH, padW, dH, dW,
-      1, 1, THCTensor_(data)(state, columns)
-    );
-
-    // M,N,K are dims of matrix A and B
-    // (see http://docs.nvidia.com/cuda/cublas/#cublas-lt-t-gt-gemm)
-    long m = batchSize * outputHeight * outputWidth;
-    long n = nOutputPlane;
-    long k = kH * kW;
-    // real **output_n_batches = output_batches + elt*nInputPlane;
-
-    // Do GEMM (note: this is a bit confusing because gemm assumes column-major matrices)
-    // (m x k) * (k x n) = (m x n)
-    #ifdef THC_REAL_IS_HALF
-    THCudaBlas_Hgemm(
-    #elif defined(THC_REAL_IS_FLOAT)
-    THCudaBlas_Sgemm(
-    #elif defined(THC_REAL_IS_DOUBLE)
-    THCudaBlas_Dgemm(
-    #endif
-      state,
-      'n', 'n',
-      m, n, k,
-      ScalarConvert<int, real>::to(1),
-      THCTensor_(data)(state, columns), m,
-      THCTensor_(data)(state, weight_i), k,
-      ScalarConvert<int, real>::to(1),
-      THCTensor_(data)(state, outputTransposed_i), m
-    );
-  }
-
-  invTransposeOutput
-    <<<GET_BLOCKS(THCTensor_(nElement)(state, output)), 
-    CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>>(
-        THCTensor_(data)(state, output), THCTensor_(data)(state, outputTransposed),
-        batchSize, nInputPlane, nOutputPlane, outputHeight*outputHeight);
-  THCudaCheck(cudaGetLastError());
-*/
   // transpose back
   transposeWithBuffer(state, weight, columns->storage, 0, 1);
 
@@ -530,84 +397,8 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
   // Batch size + input planes
   long batchSize = input->size[0];
 
-  transposeWithBuffer(state, weight, gradColumns->storage, 0, 1);
-
-/*
-  // Make sure `ones` buffer is at least as large as `gradOutput`
-  THCTensor *gradOutputTransposed = ones;
-  THCTensor_(resize4d)(state, ones, 
-    nInputPlane, nOutputPlane, batchSize, outputHeight*outputWidth);
-
-  transposeGradOutput
-    <<<GET_BLOCKS(THCTensor_(nElement)(state, gradOutput)), 
-    CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>>(
-        THCTensor_(data)(state, gradOutputTransposed), THCTensor_(data)(state, gradOutput),
-        batchSize, nInputPlane, nOutputPlane, outputHeight*outputHeight);
-  THCudaCheck(cudaGetLastError());
-  
-  // Resize temporary columns
-  THCTensor_(resize3d)(state, gradColumns, kW*kH, batchSize, outputHeight*outputWidth);
-*/
   // Resize output
   THCTensor_(resize4d)(state, gradInput, batchSize, nInputPlane, inputHeight, inputWidth);
-
-
-/*
-  // Helpers
-  THCTensor *gradInput_n  = THCTensor_(new)(state);
-  THCTensor *gradOutput_n = THCTensor_(new)(state);
-
-  // Helpers for DepthWiseConvolution
-  THCTensor *gradOutputTransposed_i  = THCTensor_(new)(state);
-  THCTensor *weight_i                = THCTensor_(new)(state);
-
-  // For each elt in batch, do:
-  for (int inPlaneIdx = 0; inPlaneIdx < nInputPlane; inPlaneIdx++) {
-    // Matrix mulitply per sample:
-    THCTensor_(select)(state, weight_i, weight, 0, inPlaneIdx);
-    THCTensor_(select)(state, gradOutputTransposed_i, gradOutputTransposed, 0, inPlaneIdx);
-
-    long m = batchSize * outputHeight * outputWidth;
-    long n = kW * kH;
-    long k = nOutputPlane;
-    // const real **gradOutput_n_batches = gradOutput_batches + elt*nInputPlane;
-
-    // Do GEMM (note: this is a bit confusing because gemm assumes column-major matrices)
-    #ifdef THC_REAL_IS_FLOAT
-    THCudaBlas_Sgemm(
-    #elif defined(THC_REAL_IS_HALF)
-    THCudaBlas_Hgemm(
-    #elif defined(THC_REAL_IS_DOUBLE)
-    THCudaBlas_Dgemm(
-    #endif
-        state,
-        'n', 't',
-        m, n, k,
-        ScalarConvert<int, real>::to(1),
-        THCTensor_(data)(state, gradOutputTransposed_i), m,
-        THCTensor_(data)(state, weight_i), n,
-        ScalarConvert<int, real>::to(0),
-        THCTensor_(data)(state, gradColumns), m
-    );
-  
-    // Unpack columns back into input:
-    col2im_depthwise<real, accreal>(
-      THCState_getCurrentStream(state),
-      THCTensor_(data)(state, gradColumns),
-      batchSize, nInputPlane, inPlaneIdx, 
-      inputHeight, inputWidth, kH, kW, padH, padW, dH, dW,
-      1, 1, THCTensor_(data)(state, gradInput)
-    );
-  }
-
-  // Free
-  THCTensor_(free)(state, gradInput_n);
-  THCTensor_(free)(state, gradOutput_n);
-
-  THCTensor_(free)(state, gradOutputTransposed_i);
-  THCTensor_(free)(state, weight_i);
-*/
-  transposeWithBuffer(state, weight, gradColumns->storage, 0, 1);
 
   updateGradInputKernel <<<GET_BLOCKS(THCTensor_(nElement)(state, gradInput)), 
                         CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>>(
@@ -626,6 +417,41 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
 
   THCTensor_(free)(state, input);
   THCTensor_(free)(state, gradOutput);
+}
+
+// A helper function for complex tensor transpose in accGradParameters. Need this kernel because,
+// for some reason, `gradOutputTransposed:copy(gradOutput:transpose(0,1):transpose(1,2))`
+// works 1.5-2 times slower with large tensors.
+// This one is for 1-2-0 transpose:
+__global__ void transposeGradOutput(
+  real *gradOutputTransposed, const real *gradOutput, int batchSize, 
+  int nInputPlane, int nOutputPlane, int elementsPerPlane) {
+
+  // gradOutput           is (batchSize) x (nInputPlane) x (nOutputPlane) x (h) x (w)
+  // gradOutputTransposed is (nInputPlane) x (nOutputPlane) x (batchSize) x (h) x (w)
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  if (index < batchSize * nInputPlane * nOutputPlane * elementsPerPlane) { 
+
+    int pixelIdx = index % elementsPerPlane; // index of a pixel in the plane
+    index /= elementsPerPlane;
+    int outPlaneIdx = index % nOutputPlane;
+    index /= nOutputPlane;
+    int inPlaneIdx = index % nInputPlane;
+    index /= nInputPlane; // `index` is now the index of a sample in batch
+
+    gradOutputTransposed[
+      elementsPerPlane * batchSize * nOutputPlane * inPlaneIdx +
+      elementsPerPlane * batchSize * outPlaneIdx +
+      elementsPerPlane * index +
+      pixelIdx] =
+
+    gradOutput[
+      elementsPerPlane * nOutputPlane * nInputPlane * index +
+      elementsPerPlane * nOutputPlane * inPlaneIdx +
+      elementsPerPlane * outPlaneIdx +
+      pixelIdx];
+  }
 }
 
 void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
@@ -688,16 +514,10 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
 
   THNN_(SpatialDepthWiseConvolution_shapeCheck)
        (state, input, gradOutput, gradWeight, gradBias, kH, kW, dH, dW, padH, padW);
-  
-  // Resize temporary columns
-  THCTensor_(resize3d)(state, columns, kW*kH, batchSize, outputHeight*outputWidth);
 
-  // merge two last (spatial) dimensions
-  THCTensor_(setStorage3d)(state, gradWeight, 
-    gradWeight->storage, gradWeight->storageOffset,
-    nOutputPlane, -1, nInputPlane, -1, kH*kW, -1);
+  // Do bias first
 
-  transposeWithBuffer(state, gradBias  , columns->storage, 0, 1);
+  transposeWithBuffer(state, gradBias, columns->storage, 0, 1);
 
   // Define a buffer of ones, for bias accumulation
   if (ones->nDimension != 2 || ones->size[0]*ones->size[1] < outputHeight*outputWidth) {
@@ -754,9 +574,21 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
     }
   }
 
+  transposeWithBuffer(state, gradBias, columns->storage, 0, 1);
+
+  // OK, bias done, now do gradWeight
+
+  // merge two last (spatial) dimensions
+  THCTensor_(setStorage3d)(state, gradWeight, 
+    gradWeight->storage, gradWeight->storageOffset,
+    nOutputPlane, -1, nInputPlane, -1, kH*kW, -1);
+
   transposeWithBuffer(state, gradWeight, columns->storage, 0, 1);
   // transpose for proper accumulation in GEMM
   transposeWithBuffer(state, gradWeight, columns->storage, 1, 2);
+
+  // Resize temporary columns
+  THCTensor_(resize3d)(state, columns, kW*kH, batchSize, outputHeight*outputWidth);
 
   THCTensor_(resize4d)(state, ones, nInputPlane, nOutputPlane, batchSize, outputHeight*outputWidth);
   THCTensor *gradOutputTransposed = ones;
@@ -817,12 +649,10 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   transposeWithBuffer(state, gradWeight, columns->storage, 1, 2);
   transposeWithBuffer(state, gradWeight, columns->storage, 0, 1);
 
-  // un-merge two last (spatial) dimensions
+  // un-merge two last (spatial) dimensions back
   THCTensor_(setStorage4d)(state, gradWeight,
     gradWeight->storage, gradWeight->storageOffset,
     nOutputPlane, -1, nInputPlane, -1, kH, -1, kW, -1);
-
-  transposeWithBuffer(state, gradBias  , columns->storage, 0, 1);
 
   // Free
   THCTensor_(free)(state, input_n);
