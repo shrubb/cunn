@@ -236,8 +236,9 @@ void THNN_(SpatialDepthWiseConvolution_updateOutput)(
     THCTensor_(zero)(state, output);
   }
 
-  updateOutputKernel <<<GET_BLOCKS(THCTensor_(nElement)(state, output)), 
-                        CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>>(
+  updateOutputKernel
+    <<<GET_BLOCKS(THCTensor_(nElement)(state, output)), 
+    CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>>(
       THCTensor_(data)(state, output), THCTensor_(data)(state, input),
       THCTensor_(data)(state, weight), batchSize,
       inputHeight, inputWidth, nInputPlane, nOutputPlane, 
@@ -400,8 +401,9 @@ void THNN_(SpatialDepthWiseConvolution_updateGradInput)(
   // Resize output
   THCTensor_(resize4d)(state, gradInput, batchSize, nInputPlane, inputHeight, inputWidth);
 
-  updateGradInputKernel <<<GET_BLOCKS(THCTensor_(nElement)(state, gradInput)), 
-                        CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>>(
+  updateGradInputKernel
+    <<<GET_BLOCKS(THCTensor_(nElement)(state, gradInput)), 
+    CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>>(
       THCTensor_(data)(state, gradInput), THCTensor_(data)(state, gradOutput),
       THCTensor_(data)(state, weight), batchSize,
       inputHeight, inputWidth, nInputPlane, nOutputPlane, 
@@ -515,7 +517,7 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   THNN_(SpatialDepthWiseConvolution_shapeCheck)
        (state, input, gradOutput, gradWeight, gradBias, kH, kW, dH, dW, padH, padW);
 
-  // Do bias first
+  // Do `gradBias` first:
 
   transposeWithBuffer(state, gradBias, columns->storage, 0, 1);
 
@@ -576,7 +578,7 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
 
   transposeWithBuffer(state, gradBias, columns->storage, 0, 1);
 
-  // OK, bias done, now do gradWeight
+  // OK, bias done, now let's do `gradWeight`:
 
   // merge two last (spatial) dimensions
   THCTensor_(setStorage3d)(state, gradWeight, 
@@ -590,26 +592,24 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   // Resize temporary columns
   THCTensor_(resize3d)(state, columns, kW*kH, batchSize, outputHeight*outputWidth);
 
-  THCTensor_(resize4d)(state, ones, nInputPlane, nOutputPlane, batchSize, outputHeight*outputWidth);
-  THCTensor *gradOutputTransposed = ones;
+  THCTensor_(resize3d)(state, ones, nOutputPlane, batchSize, outputHeight*outputWidth);
+  THCTensor *gradOutputGrouped = ones;
 
-  transposeGradOutput
-    <<<GET_BLOCKS(THCTensor_(nElement)(state, gradOutput)), 
-    CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state)>>>(
-        THCTensor_(data)(state, gradOutputTransposed), THCTensor_(data)(state, gradOutput),
-        batchSize, nInputPlane, nOutputPlane, outputHeight*outputHeight);
-  THCudaCheck(cudaGetLastError());
-
-  THCTensor *gradOutputTransposed_i = THCTensor_(new)(state);
   THCTensor *gradWeight_i = THCTensor_(new)(state);
+  THCTensor *gradOutput_i = THCTensor_(new)(state);
 
   for (int inPlaneIdx = 0; inPlaneIdx < nInputPlane; ++inPlaneIdx) {
+
+    // group gradOutput planes by input plane index and transpose
+    // `gradOutputGrouped` has size (nOutputPlane) x (batchSize) x (outputHeight) x (outputWidth)
+    THCTensor_(select)(state, gradOutput_i, gradOutput, 1, inPlaneIdx);
+    THCTensor_(transpose)(state, gradOutput_i, gradOutput_i, 0, 1);
+    THCTensor_(copy)(state, gradOutputGrouped, gradOutput_i);
 
     // columns: (kW*kH) x (batchSize) x (outputHeight*outputWidth)
     // gradOutputTransposed: (nInputPlane) x (nOutputPlane) x (batchSize) x (outputHeight*outputWidth)
     // gradWeight: (nInputPlane) x (nOutputPlane) x (kH*kW)
     THCTensor_(select)(state, gradWeight_i, gradWeight, 0, inPlaneIdx);
-    THCTensor_(select)(state, gradOutputTransposed_i, gradOutputTransposed, 0, inPlaneIdx);
     
     // Extract columns:
     im2col_depthwise(
@@ -638,7 +638,7 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
         't', 'n',
         m, n, k,
         scale,
-        THCTensor_(data)(state, gradOutputTransposed_i), k,
+        THCTensor_(data)(state, gradOutputGrouped), k,
         THCTensor_(data)(state, columns), k,
         ScalarConvert<int, real>::to(1),
         THCTensor_(data)(state, gradWeight_i), m
@@ -658,8 +658,8 @@ void THNN_(SpatialDepthWiseConvolution_accGradParameters)(
   THCTensor_(free)(state, input_n);
   THCTensor_(free)(state, gradOutput_n);
 
-  THCTensor_(free)(state, gradOutputTransposed_i);
   THCTensor_(free)(state, gradWeight_i);
+  THCTensor_(free)(state, gradOutput_i);
 
   // Resize
   if (batch == 0) {
